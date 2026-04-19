@@ -10,4 +10,4 @@
 
 ## Запуск
 ```powershell
-.\script.ps1
+.\app.ps1
