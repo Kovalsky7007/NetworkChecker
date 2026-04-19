@@ -1,0 +1,52 @@
+# === Государственные и инфраструктурные сервисы ===
+gosuslugi.ru
+nalog.gov.ru
+mos.ru
+pfr.gov.ru
+
+# === Поисковики и порталы ===
+yandex.ru
+ya.ru
+mail.ru
+rambler.ru
+
+# === Социальные сети и общение ===
+vk.com
+ok.ru
+dzen.ru
+rutube.ru
+
+# === Банки и финансы ===
+sberbank.ru
+tbank.ru
+vtb.ru
+gazprombank.ru
+alfabank.ru
+
+# === Маркетплейсы и ритейл ===
+ozon.ru
+wildberries.ru
+market.yandex.ru
+avito.ru
+megamarket.ru
+lamoda.ru
+
+# === Экосистемы и сервисы ===
+mts.ru
+megafon.ru
+beeline.ru
+tele2.ru
+rt.ru
+
+# === Новости и медиа ===
+rbc.ru
+lenta.ru
+ria.ru
+tass.ru
+kommersant.ru
+
+# === ИТ и образование ===
+habr.com
+gcore.com
+stepik.org
+hh.ru
