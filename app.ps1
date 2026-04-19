@@ -1,21 +1,21 @@
-﻿if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
     Write-Host "Запуск от имени администратора для полной диагностики..." -ForegroundColor Yellow
     Start-Process -FilePath "powershell.exe" -ArgumentList "-File `"$PSCommandPath`"" -Verb RunAs
-
 }
+
 # ==============================
-# 📁 Рабочая директория
+# РАБОЧАЯ ДИРЕКТОРИЯ
 # ==============================
 Set-Location -Path $PSScriptRoot   # чтобы lists\ всегда были рядом со скриптом
 
 # ==============================
-# 🔤 UTF-8 вывод
+# UTF-8 ВЫВОД
 # ==============================
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 
 # ==============================
-# 🌐 ВНЕШНИЙ IP
+# ВНЕШНИЙ IP
 # ==============================
 function Get-ExternalIP {
     try {
@@ -28,7 +28,7 @@ function Get-ExternalIP {
 
 
 # ==============================
-# 🌍 GEO по IP
+# GEO ПО IP
 # ==============================
 function Get-Geo {
     param($ip)
@@ -53,52 +53,98 @@ function Get-Geo {
 
 
 # ==============================
-# 🖥 ЛОКАЛЬНЫЙ IP
+# ЛОКАЛЬНЫЙ IP (активный адаптер с Default Gateway)
+# ИСПРАВЛЕНО: раньше хватал первый попавшийся адрес
+# (мог быть виртуальный адаптер или статика без шлюза)
 # ==============================
 function Get-LocalIP {
     try {
-        Get-NetIPAddress -AddressFamily IPv4 |
-        Where-Object {
-            $_.IPAddress -notlike "127.*" -and $_.PrefixOrigin -ne "WellKnown"
-        } |
-        Select-Object -First 1 -ExpandProperty IPAddress
+        # Находим интерфейсы у которых есть Default Gateway — это и есть активные
+        $activeIndex = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction Stop |
+                       Sort-Object RouteMetric |
+                       Select-Object -First 1 -ExpandProperty InterfaceIndex
+
+        Get-NetIPAddress -InterfaceIndex $activeIndex -AddressFamily IPv4 -ErrorAction Stop |
+            Select-Object -First 1 -ExpandProperty IPAddress
     }
     catch {
-        "N/A"
+        # Fallback: старый метод если Get-NetRoute недоступен
+        try {
+            Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -notlike "127.*" -and $_.PrefixOrigin -ne "WellKnown" } |
+            Select-Object -First 1 -ExpandProperty IPAddress
+        }
+        catch {
+            "N/A"
+        }
     }
 }
 
 
 # ==============================
-# 📡 ПИНГ С СТАТИСТИКОЙ
+# ПИНГ С СТАТИСТИКОЙ
+# ИСПРАВЛЕНО: PS 5.1 использует .ResponseTime, PS 7+ использует .Latency
+# Решение: используем .NET System.Net.NetworkInformation.Ping напрямую —
+# работает одинаково в обеих версиях
 # ==============================
 function Get-PingStats {
-    param($ip)
+    param(
+        $ip,
+        [int]$Count = 3   # количество пингов (можно передать 5 или 10 для медианы)
+    )
 
     if (-not $ip) {
-        return @{ Avg="N/A"; Loss=100 }
+        return @{ Avg="N/A"; Median="N/A"; Min="N/A"; Max="N/A"; Loss=100 }
     }
 
     try {
-        $results = Test-Connection -ComputerName $ip -Count 3 -ErrorAction Stop
+        $pingSender = New-Object System.Net.NetworkInformation.Ping
+        $times = [System.Collections.Generic.List[int]]::new()
+        $failed = 0
 
-        $avg = ($results | Measure-Object ResponseTime -Average).Average
+        for ($i = 0; $i -lt $Count; $i++) {
+            $reply = $pingSender.Send($ip, 1000)   # таймаут 1 сек на каждый пинг
+
+            if ($reply.Status -eq "Success") {
+                $times.Add([int]$reply.RoundtripTime)
+            }
+            else {
+                $failed++
+            }
+        }
+
+        if ($times.Count -eq 0) {
+            return @{ Avg="timeout"; Median="timeout"; Min="N/A"; Max="N/A"; Loss=100 }
+        }
+
+        # Считаем медиану
+        $sorted = $times | Sort-Object
+        $mid = [math]::Floor($sorted.Count / 2)
+        if ($sorted.Count % 2 -eq 0) {
+            $median = [math]::Round(($sorted[$mid - 1] + $sorted[$mid]) / 2, 1)
+        }
+        else {
+            $median = $sorted[$mid]
+        }
+
+        $loss = [math]::Round(($failed / $Count) * 100, 0)
+
         return @{
-            Avg = [math]::Round($avg,1)
-            Loss = 0
+            Avg    = [math]::Round(($times | Measure-Object -Average).Average, 1)
+            Median = $median
+            Min    = ($sorted | Select-Object -First 1)
+            Max    = ($sorted | Select-Object -Last 1)
+            Loss   = $loss
         }
     }
     catch {
-        return @{
-            Avg = "timeout"
-            Loss = 100
-        }
+        return @{ Avg="N/A"; Median="N/A"; Min="N/A"; Max="N/A"; Loss=100 }
     }
 }
 
 
 # ==============================
-# 🔎 TLS CHECK (443 handshake)
+# TLS CHECK (TCP:443 handshake)
 # ==============================
 function Test-TLS {
     param($ip)
@@ -122,49 +168,87 @@ function Test-TLS {
 
 
 # ==============================
-# 🔎 ДОМЕН ТЕСТ
+# DNS RESOLVE
+# ИСПРАВЛЕНО: добавлен fallback через [System.Net.Dns] на случай
+# если Resolve-DnsName недоступен (некоторые минимальные сборки Windows)
 # ==============================
-function Test-Domain {
+function Resolve-Domain {
     param($domain)
 
-    $dns = "FAIL"
-    $ip = ""
-    $http = "FAIL"
-
-    # DNS
+    # Попытка 1: Resolve-DnsName (есть на большинстве систем)
     try {
         $res = Resolve-DnsName $domain -ErrorAction Stop |
                Where-Object { $_.Type -eq "A" } |
                Select-Object -First 1
 
         if ($res) {
-            $dns = "OK"
-            $ip = $res.IPAddress
+            return @{ OK=$true; IP=$res.IPAddress }
         }
     }
     catch {}
 
-    # ping + tls
-    $pingAvg = "N/A"
-    $loss = 100
-    $tls = "FAIL"
+    # Попытка 2: .NET fallback (работает везде)
+    try {
+        $addresses = [System.Net.Dns]::GetHostAddresses($domain) |
+                     Where-Object { $_.AddressFamily -eq "InterNetwork" }
 
-    if ($ip) {
-        $p = Get-PingStats $ip
-        $pingAvg = $p.Avg
-        $loss = $p.Loss
+        if ($addresses) {
+            return @{ OK=$true; IP=$addresses[0].ToString() }
+        }
+    }
+    catch {}
 
-        $tls = Test-TLS $ip
+    return @{ OK=$false; IP="" }
+}
+
+
+# ==============================
+# ДОМЕН ТЕСТ (основная функция)
+# ==============================
+function Test-Domain {
+    param(
+        $domain,
+        [int]$PingCount = 3   # по умолчанию 3 пинга, можно передать больше
+    )
+
+    $dns = "FAIL"
+    $ip  = ""
+
+    # DNS resolve (с fallback)
+    $dnsResult = Resolve-Domain $domain
+    if ($dnsResult.OK) {
+        $dns = "OK"
+        $ip  = $dnsResult.IP
     }
 
-    # HTTP check (более честный)
+    # Пинг + TLS
+    $pingAvg = "N/A"
+    $loss    = 100
+    $tls     = "FAIL"
+
+    if ($ip) {
+        $p       = Get-PingStats $ip -Count $PingCount
+        $pingAvg = $p.Avg
+        $loss    = $p.Loss
+        $tls     = Test-TLS $ip
+    }
+
+    # HTTP check
+    # ИСПРАВЛЕНО: добавлен User-Agent — без него VK, Ozon и другие сайты
+    # возвращают 403/блокируют запрос, что давало ложный FAIL
+    $http = "FAIL"
+    $ua   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+
     try {
-        $r = Invoke-WebRequest "https://$domain" -Method Head -TimeoutSec 3 -UseBasicParsing -MaximumRedirection 3
+        $r = Invoke-WebRequest "https://$domain" -Method Head -TimeoutSec 4 `
+             -UseBasicParsing -MaximumRedirection 3 -UserAgent $ua
         $http = $r.StatusCode
     }
     catch {
+        # Если HTTPS упал — пробуем HTTP
         try {
-            $r = Invoke-WebRequest "http://$domain" -Method Head -TimeoutSec 3 -UseBasicParsing
+            $r = Invoke-WebRequest "http://$domain" -Method Head -TimeoutSec 4 `
+                 -UseBasicParsing -UserAgent $ua
             $http = $r.StatusCode
         }
         catch {
@@ -173,21 +257,24 @@ function Test-Domain {
     }
 
     # ==============================
-    # 🧠 STATUS ENGINE (улучшенный)
+    # STATUS ENGINE
+    # UP       — DNS OK + HTTP 2xx/3xx
+    # DEGRADED — DNS OK + сервер виден (TLS или частичный HTTP), но полный доступ блокируется
+    # DOWN     — DNS FAIL или всё недоступно
     # ==============================
     $status = "DOWN"
 
     if ($dns -eq "FAIL") {
         $status = "DOWN"
     }
-    elseif ($dns -eq "OK" -and $tls -eq "FAIL") {
-        $status = "DEGRADED"
-    }
-    elseif ($http -eq "FAIL") {
-        $status = "DEGRADED"
-    }
-    elseif ($http -match "20|30") {
+    elseif ($http -match "^(2|3)") {
+        # HTTP вернул успешный код — сайт работает
         $status = "UP"
+    }
+    elseif ($dns -eq "OK" -and ($tls -eq "OK" -or $loss -lt 100)) {
+        # DNS прошёл, сервер пингуется или TCP открыт — но HTTP заблокирован
+        # Классический признак DPI/замедления
+        $status = "DEGRADED"
     }
 
     return [PSCustomObject]@{
@@ -204,13 +291,12 @@ function Test-Domain {
 
 
 # ==============================
-# 📊 IP INFO
+# IP INFO
 # ==============================
 function Show-IPInfo {
-
-    $local = Get-LocalIP
+    $local    = Get-LocalIP
     $external = Get-ExternalIP
-    $geo = Get-Geo $external
+    $geo      = Get-Geo $external
 
     Write-Host "=====================================" -ForegroundColor Cyan
     Write-Host "IP информация" -ForegroundColor Yellow
@@ -223,34 +309,29 @@ function Show-IPInfo {
 
 
 # ==============================
-# 🔌 CONNECTIONS
+# CONNECTIONS
 # ==============================
 function Show-Connections {
-
     Write-Host "`n=== Активные соединения ===" -ForegroundColor Yellow
 
     $proc = @{}
-    Get-Process | ForEach-Object {
-        $proc[$_.Id] = $_.ProcessName
-    }
+    Get-Process | ForEach-Object { $proc[$_.Id] = $_.ProcessName }
 
     netstat -ano | ForEach-Object {
-
         if ($_ -notmatch "ESTABLISHED") { return }
 
         $line = ($_ -replace '\s+', ' ').Trim()
-        $p = $line.Split(' ')
+        $p    = $line.Split(' ')
 
         if ($p.Count -lt 5) { return }
 
-        $remote = $p[2]
-        $pidRaw = $p[-1]
+        $remote   = $p[2]
+        $pidRaw   = $p[-1]
 
         if ($pidRaw -notmatch '^\d+$') { return }
 
         $pidValue = [int]$pidRaw
-
-        $name = if ($proc.ContainsKey($pidValue)) { $proc[$pidValue] } else { "Unknown" }
+        $name     = if ($proc.ContainsKey($pidValue)) { $proc[$pidValue] } else { "Unknown" }
 
         [PSCustomObject]@{
             Process = $name
@@ -263,7 +344,7 @@ function Show-Connections {
 
 
 # ==============================
-# 📋 LIST CHECK
+# LIST CHECK
 # ==============================
 function Check-List {
     param($file)
@@ -278,25 +359,116 @@ function Check-List {
     $domains = Get-Content $file | Where-Object { $_ -and -not $_.StartsWith("#") }
 
     foreach ($d in $domains) {
-
         $r = Test-Domain $d
 
+        $color = switch ($r.Status) {
+            "UP"       { "Green" }
+            "DEGRADED" { "Yellow" }
+            "DOWN"     { "Red" }
+            default    { "White" }
+        }
+
         Write-Host ("{0,-25} {1,-8} DNS:{2,-4} TLS:{3,-4} HTTP:{4,-6} PING:{5,-10} LOSS:{6,-6} IP:{7}" -f `
-            $r.Domain,
-            $r.Status,
-            $r.DNS,
-            $r.TLS,
-            $r.HTTP,
-            $r.Ping,
-            $r.Loss,
-            $r.IP
-        )
+            $r.Domain, $r.Status, $r.DNS, $r.TLS, $r.HTTP, $r.Ping, $r.Loss, $r.IP
+        ) -ForegroundColor $color
     }
 }
 
 
 # ==============================
-# 📟 MENU
+# ОДИНОЧНАЯ ПРОВЕРКА С МЕДИАНОЙ (пункт 6)
+# Позволяет ввести домен(ы) вручную и получить детальную статистику
+# ==============================
+function Check-Single {
+
+    Write-Host "`n=== Одиночная проверка ===" -ForegroundColor Cyan
+    Write-Host "Введите домен(ы) через запятую (например: google.com,vk.com)"
+
+    $input = Read-Host "Домен(ы)"
+    if (-not $input) { return }
+
+    # Количество пингов
+    Write-Host "Количество пингов для медианы [по умолчанию 10]:"
+    $countRaw = Read-Host "Количество (Enter = 10)"
+
+    # ИСПРАВЛЕНО: не используем тернарный оператор ?: — он не работает в PS 5.1
+    if ($countRaw -match '^\d+$' -and [int]$countRaw -gt 0) {
+        $pingCount = [int]$countRaw
+    }
+    else {
+        $pingCount = 10
+    }
+
+    $domains = $input -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+    foreach ($domain in $domains) {
+        Write-Host "`n--- $domain ---" -ForegroundColor Cyan
+
+        # DNS
+        $dnsResult = Resolve-Domain $domain
+        $dns = if ($dnsResult.OK) { "OK" } else { "FAIL" }
+        $ip  = $dnsResult.IP
+
+        Write-Host "DNS    : $dns  IP: $ip"
+
+        if (-not $ip) {
+            Write-Host "Статус : DOWN (DNS не прошёл)" -ForegroundColor Red
+            continue
+        }
+
+        # Пинг с медианой
+        Write-Host "Пингую $pingCount раз..." -NoNewline
+        $p = Get-PingStats $ip -Count $pingCount
+        Write-Host " готово"
+
+        Write-Host ("Ping   : avg={0}ms  median={1}ms  min={2}ms  max={3}ms  loss={4}%" -f `
+            $p.Avg, $p.Median, $p.Min, $p.Max, $p.Loss)
+
+        # TLS
+        $tls = Test-TLS $ip
+        Write-Host "TLS    : $tls"
+
+        # HTTP
+        $ua  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+        $http = "FAIL"
+        try {
+            $r = Invoke-WebRequest "https://$domain" -Method Head -TimeoutSec 4 `
+                 -UseBasicParsing -MaximumRedirection 3 -UserAgent $ua
+            $http = $r.StatusCode
+        }
+        catch {
+            try {
+                $r = Invoke-WebRequest "http://$domain" -Method Head -TimeoutSec 4 `
+                     -UseBasicParsing -UserAgent $ua
+                $http = $r.StatusCode
+            }
+            catch { $http = "FAIL" }
+        }
+        Write-Host "HTTP   : $http"
+
+        # Итоговый статус
+        $status = "DOWN"
+        if ($http -match "^(2|3)") {
+            $status = "UP"
+        }
+        elseif ($dns -eq "OK" -and ($tls -eq "OK" -or $p.Loss -lt 100)) {
+            $status = "DEGRADED"
+        }
+
+        $color = switch ($status) {
+            "UP"       { "Green" }
+            "DEGRADED" { "Yellow" }
+            "DOWN"     { "Red" }
+            default    { "White" }
+        }
+
+        Write-Host "Статус : $status" -ForegroundColor $color
+    }
+}
+
+
+# ==============================
+# МЕНЮ
 # ==============================
 do {
     Clear-Host
@@ -308,6 +480,7 @@ do {
     Write-Host "3 - Foreign"
     Write-Host "4 - Streaming"
     Write-Host "5 - Custom"
+    Write-Host "6 - Одиночная проверка (медиана пинга)"
     Write-Host "0 - Выход"
 
     $c = Read-Host "Выбор"
@@ -318,6 +491,7 @@ do {
         "3" { Check-List "lists\foreign.txt"; Read-Host "Enter" }
         "4" { Check-List "lists\streaming.txt"; Read-Host "Enter" }
         "5" { Check-List "lists\custom.txt"; Read-Host "Enter" }
+        "6" { Check-Single; Read-Host "Enter" }
         "0" { exit }
     }
 
