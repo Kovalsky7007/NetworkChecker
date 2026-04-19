@@ -1,0 +1,42 @@
+# === Поисковики и ИТ-гиганты ===
+google.com
+bing.com
+duckduckgo.com
+apple.com
+microsoft.com
+
+# === Социальные сети и общение ===
+x.com
+reddit.com
+discord.com
+telegram.org
+whatsapp.com
+quora.com
+
+# === Игры и дистрибуция ===
+steampowered.com
+epicgames.com
+ea.com
+ubisoft.com
+blizzard.com
+roblox.com
+minecraft.net
+
+# === Медиа и Видео ===
+youtube.com
+twitch.tv
+vimeo.com
+imdb.com
+fandom.com
+
+# === Разработка и технологии ===
+github.com
+stackoverflow.com
+openai.com
+cloudflare.com
+docker.com
+
+# === Магазины ===
+amazon.com
+ebay.com
+aliexpress.com
