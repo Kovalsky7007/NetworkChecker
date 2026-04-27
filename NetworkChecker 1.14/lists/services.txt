@@ -1,0 +1,17 @@
+aliexpress.com
+aliexpress.ru
+alicdn.com
+amazon.com
+images-amazon.com
+ssl-images-amazon.com
+ebay.com
+apple.com
+icloud.com
+mzstatic.com
+://apple.com
+netflix.com
+nflxvideo.net
+spotify.com
+scdn.co
+twitch.tv
+ttvnw.net
