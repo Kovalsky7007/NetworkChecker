@@ -1,2 +1,0 @@
-﻿russian_trusted_root_ca.cer
-russian_trusted_root_ca_gost_2025.cer
