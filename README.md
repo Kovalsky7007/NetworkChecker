@@ -115,3 +115,5 @@ Certs\   — сертификаты для Smart Arbitration
 
 Anton Sidorenko
 AI-assisted development
+
+2026
