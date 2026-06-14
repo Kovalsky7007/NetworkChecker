@@ -1,0 +1,20 @@
+# ── Runtime / генерируется при работе ──
+Logs/*
+!Logs/.gitkeep
+Certs/active_certs.txt
+*.log
+debug_verbose.log
+
+# ── Локальные бэкапы и архивы (не для репозитория) ──
+*.bak
+исходники/
+Certs/*.zip
+
+# ── Инструменты разработки ──
+.claude/
+
+# ── Системный мусор ──
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
