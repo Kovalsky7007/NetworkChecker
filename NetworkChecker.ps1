@@ -92,7 +92,7 @@ param(
 # Используется в меню, шапках отчётов, логах и Руководстве.
 # (В комментариях-истории версии оставлены как есть — это хронология.)
 # ============================================================
-$script:Version    = "1.14.5"
+$script:Version    = "1.14.8"
 $script:VersionTag = "v$script:Version"
 
 # Если передан флаг -DebugMode при запуске — активируем Verbose-вывод сразу.
@@ -168,6 +168,7 @@ $global:T = @{
         PingPrompt = "Количество пингов для медианы [по умолчанию 10]:"
         PingInput  = "Количество (Enter = 10)"
         StatusLbl  = "Статус"
+        VerdictLbl = "Вывод"
         DownDNS    = "DOWN (DNS не прошёл)"
         ListPrompt = "Введите номер(а) через запятую или 'all' для всех:"
         ListHint   = "Пример: 1,3  или  all  или  0 для отмены"
@@ -196,6 +197,7 @@ $global:T = @{
         PingPrompt = "Number of pings for the median [default 10]:"
         PingInput  = "Count (Enter = 10)"
         StatusLbl  = "Status"
+        VerdictLbl = "Verdict"
         DownDNS    = "DOWN (DNS failed)"
         ListPrompt = "Enter number(s) separated by commas or 'all':"
         ListHint   = "Example: 1,3  or  all  or  0 to cancel"
@@ -484,6 +486,35 @@ function Get-LocalIP {
         }
         catch { "N/A" }
     }
+}
+
+
+# ==============================
+# DNS-СЕРВЕРЫ (через кого резолвим)
+# v1.14.6: показываем, какие DNS прописаны на активном интерфейсе. Полезно, когда
+# домен резолвится на «странный» IP (напр. заглушку) — видно, виноват ли DNS.
+# Известные публичные резолверы подписываем (Google/Cloudflare/...).
+# ==============================
+function Get-DnsServers {
+    $known = @{
+        "8.8.8.8"="Google"; "8.8.4.4"="Google"; "1.1.1.1"="Cloudflare"; "1.0.0.1"="Cloudflare"
+        "9.9.9.9"="Quad9"; "208.67.222.222"="OpenDNS"; "77.88.8.8"="Yandex"; "77.88.8.1"="Yandex"
+        "94.140.14.14"="AdGuard"; "94.140.15.15"="AdGuard"
+    }
+    try {
+        $idx = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction Stop |
+               Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty InterfaceIndex
+        $srv = (Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses
+        if (-not $srv) {
+            $srv = (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop |
+                    Where-Object { $_.ServerAddresses }).ServerAddresses
+        }
+        $srv = @($srv | Select-Object -Unique | Where-Object { $_ -and $_ -ne "127.0.0.1" })
+        if (-not $srv -or $srv.Count -eq 0) { return "N/A" }
+        return (($srv | ForEach-Object {
+            if ($known.ContainsKey($_)) { "$_ ($($known[$_]))" } else { $_ }
+        }) -join ", ")
+    } catch { return "N/A" }
 }
 
 
@@ -882,6 +913,68 @@ function Get-HttpFailReason {
 }
 
 # ==============================
+# ВЕРДИКТ ПРОСТЫМ ЯЗЫКОМ (v1.14.6)
+# Переводит сырьё DNS/TLS/HTTP/CERT в одну понятную фразу + класс для цвета:
+#   OK    — доступен (зелёный)
+#   MINOR — достижим, но не отдаёт страницу (404/403/429) или 503 — НЕ блок (циан)
+#   BLOCK — реальная проблема: DPI/RST, TLS-блок, заглушка-редирект, MITM (красный)
+#   DOWN  — нет DNS-записи (часто это норма для apex/инфра-доменов) (серый)
+# Возвращает @{ Label; Class }.
+# ==============================
+function Get-Verdict {
+    param($dns, $tls, [string]$http, $cert)
+    $ru = ($global:Lang -ne "EN")
+    $L = if ($ru) {
+        @{ ok="Доступен"; nopage="Без страницы"; dpi="Блок DPI/RST"; tlsb="Блок TLS";
+           stub="Заглушка"; mitm="MITM-перехват"; htmo="Блок (timeout)"; nodns="Нет DNS-записи";
+           down="Недоступен"; herr="HTTP-ошибка" }
+    } else {
+        @{ ok="Reachable"; nopage="No page"; dpi="DPI/RST block"; tlsb="TLS block";
+           stub="Stub redirect"; mitm="MITM intercept"; htmo="Block (timeout)"; nodns="No DNS record";
+           down="Unreachable"; herr="HTTP error" }
+    }
+
+    if ($dns -ne "OK") { return @{ Label=$L.nodns; Class="DOWN" } }
+
+    $trust  = if ($cert) { "$($cert.Trust)" }  else { "FAIL" }
+    $reason = if ($cert) { "$($cert.Reason)" } else { "" }
+    $alt    = ($cert -and $cert.AltName)
+
+    if ($trust -eq "MITM") { return @{ Label=$L.mitm; Class="BLOCK" } }
+
+    # HTTP реально отдал страницу (2xx/3xx) → домен доступен, ТОЧКА. Проверка
+    # сертификата идёт отдельным соединением и может сфлапать по таймауту
+    # (как soundcloud: HTTP:200, но TLS-проба отвалилась) — это не блок.
+    if ($http -match '^(2|3)') { return @{ Label=$L.ok; Class="OK" } }
+
+    # HTTP не отдался — разбираемся почему именно.
+    if ($tls -ne "OK") {
+        if ($reason -match "DPI|RST")     { return @{ Label=$L.dpi;  Class="BLOCK" } }
+        if ($reason -match "Timeout|TCP") { return @{ Label=$L.tlsb; Class="BLOCK" } }
+        return @{ Label=$L.tlsb; Class="BLOCK" }
+    }
+
+    # HTTP не отдался, но TLS живой
+    if ($alt)                  { return @{ Label=$L.stub; Class="BLOCK" } }   # валид.серт на чужое имя + фейл = редирект-заглушка
+    if ($http -match "RST")     { return @{ Label=$L.dpi;  Class="BLOCK" } }
+    if ($http -match "timeout") { return @{ Label=$L.htmo; Class="BLOCK" } }
+    if ($http -match "TLS-err") { return @{ Label=$L.tlsb; Class="BLOCK" } }
+    if ($http -match "403|404|429|503") { return @{ Label=$L.nopage; Class="MINOR" } }  # достижим, просто не страница
+    return @{ Label=$L.herr; Class="MINOR" }
+}
+
+function Get-VerdictColor {
+    param([string]$class)
+    switch ($class) {
+        "OK"    { "Green" }
+        "MINOR" { "DarkCyan" }
+        "BLOCK" { "Red" }
+        "DOWN"  { "DarkGray" }
+        default { "White" }
+    }
+}
+
+# ==============================
 # ДОМЕН ТЕСТ (основная функция)
 # ==============================
 function Test-Domain {
@@ -998,19 +1091,56 @@ function Test-Domain {
     # "ms" добавляем только к числовому пингу; у timeout/N/A единицы не нужны.
     $pingStr = if ("$pingAvg" -match '^\d') { "$pingAvg ms" } else { "$pingAvg" }
 
+    # Вердикт простым языком (см. Get-Verdict)
+    $v = Get-Verdict $dns $tls $http $cert
+
     return [PSCustomObject]@{
-        Domain = $domain
-        IP     = $ip
-        DNS    = $dns
-        TLS    = $tls
-        HTTP   = $http
-        Ping   = $pingStr
-        Loss   = "${loss}%"
-        Cert   = $certLabel
-        Status = $status
+        Domain  = $domain
+        IP      = $ip
+        DNS     = $dns
+        TLS     = $tls
+        HTTP    = $http
+        Ping    = $pingStr
+        Loss    = "${loss}%"
+        Cert    = $certLabel
+        Status  = $status
+        Verdict = $v.Label
+        VClass  = $v.Class
     }
 }
 
+
+# ==============================
+# ТАБЛИЧНАЯ СТРОКА + ИТОГ (v1.14.6)
+# Единый формат для всех проверок: первая колонка — вердикт простым языком,
+# дальше техсырьё DNS/TLS/HTTP/PING/LOSS/CERT/IP для тех, кому нужны детали.
+# ==============================
+function Format-ResultRow {
+    param($r)
+    # Вердикт -14, HTTP -13 (вмещает FAIL(TLS-err)), CERT -20 — колонка IP не «плывёт».
+    ("{0,-25} {1,-14} DNS:{2,-4} TLS:{3,-4} HTTP:{4,-13} PING:{5,-10} LOSS:{6,-6} CERT:{7,-20} IP:{8}" -f `
+        $r.Domain, $r.Verdict, $r.DNS, $r.TLS, $r.HTTP, $r.Ping, $r.Loss, $r.Cert, $r.IP)
+}
+
+function Write-ResultSummary {
+    # Итог по понятным классам, а не по сырым UP/DEGRADED/DOWN.
+    param([array]$Rows)
+    $ru = ($global:Lang -ne "EN")
+    $ok=0; $mi=0; $bl=0; $dw=0
+    foreach ($x in $Rows) {
+        switch ($x.VClass) { "OK" {$ok++} "MINOR" {$mi++} "BLOCK" {$bl++} "DOWN" {$dw++} }
+    }
+    $pings = $Rows | ForEach-Object { if ("$($_.Ping)" -match '^(\d+(\.\d+)?)') { [double]$Matches[1] } } | Where-Object { $_ }
+    $avg = if ($pings) { [int](($pings | Measure-Object -Average).Average) } else { 0 }
+
+    Write-Host ""
+    Write-Host ("  $(T 'Summary'): {0}   " -f $Rows.Count) -NoNewline -ForegroundColor Cyan
+    Write-Host ($(if($ru){"Доступно:"}else{"OK:"}) + $ok + " ")        -NoNewline -ForegroundColor Green
+    Write-Host ($(if($ru){"Без стр.:"}else{"No-page:"}) + $mi + " ")    -NoNewline -ForegroundColor DarkCyan
+    Write-Host ($(if($ru){"Блок:"}else{"Block:"}) + $bl + " ")          -NoNewline -ForegroundColor Red
+    Write-Host ($(if($ru){"Нет DNS:"}else{"No-DNS:"}) + $dw)            -NoNewline -ForegroundColor DarkGray
+    Write-Host ("   Avg Ping={0}ms" -f $avg) -ForegroundColor Cyan
+}
 
 # ==============================
 # [Google AI] ПРОВЕРКА ВРЕМЕНИ
@@ -1162,10 +1292,11 @@ function Format-Box {
 # ============================================================
 $global:LegendData = @{
     RU = @(Format-Box -Title "ЛЕГЕНДА" -Inner 40 -Border "Yellow" -Rows @(
-        @{T=" Итоговый статус домена:"; C="Yellow"}
-        @{T="  UP       — DNS+TLS+HTTP+CERT всё OK"; C="Green"}
-        @{T="  DEGRADED — виден, но есть проблемы"; C="Yellow"}
-        @{T="  DOWN     — DNS fail или TCP закрыт"; C="Red"}
+        @{T=" Вывод (1-я колонка):"; C="Yellow"}
+        @{T="  Доступен      — работает"; C="Green"}
+        @{T="  Без страницы  — достижим, нет стр."; C="DarkCyan"}
+        @{T="  Блок …        — DPI/TLS/заглушка/MITM"; C="Red"}
+        @{T="  Нет DNS-записи— не резолвится"; C="DarkGray"}
         @{Sep=$true}
         @{T=" CERT — статус сертификата:"; C="Yellow"}
         @{T="  TRUSTED       — цепочка доверия OK"; C="White"}
@@ -1192,10 +1323,11 @@ $global:LegendData = @{
     )) + @([pscustomobject]@{T="  L — скрыть/показать легенду"; C="DarkGray"})
 
     EN = @(Format-Box -Title "LEGEND" -Inner 40 -Border "Yellow" -Rows @(
-        @{T=" Domain status:"; C="Yellow"}
-        @{T="  UP       — DNS+TLS+HTTP+CERT all OK"; C="Green"}
-        @{T="  DEGRADED — reachable but blocking"; C="Yellow"}
-        @{T="  DOWN     — DNS fail or TCP closed"; C="Red"}
+        @{T=" Verdict (col 1):"; C="Yellow"}
+        @{T="  Reachable     — works"; C="Green"}
+        @{T="  No page       — reachable, no page"; C="DarkCyan"}
+        @{T="  Block …       — DPI/TLS/stub/MITM"; C="Red"}
+        @{T="  No DNS record — not resolving"; C="DarkGray"}
         @{Sep=$true}
         @{T=" CERT — certificate status:"; C="Yellow"}
         @{T="  TRUSTED       — chain verified OK"; C="White"}
@@ -1242,6 +1374,7 @@ function Show-IPInfo {
     $local    = Get-LocalIP
     $external = if ($global:CachedExternalIP) { $global:CachedExternalIP } else { "..." }
     $geo      = if ($global:CachedGeo)        { $global:CachedGeo        } else { "..." }
+    $dns      = if ($global:CachedDns)        { $global:CachedDns        } else { "..." }
     $isRU     = ($global:Lang -ne "EN")
     $debug    = if ($global:DebugMode) { " [DEBUG]" } else { "" }
     # Количество активных сертификатов — рядом с пунктом 9
@@ -1262,10 +1395,12 @@ function Show-IPInfo {
         [pscustomobject]@{T="  Local IP   : $local";C="White"}
         [pscustomobject]@{T="  External IP: $external";C="White"}
         [pscustomobject]@{T="  Geo        : $geo";C="White"}
+        [pscustomobject]@{T="  DNS        : $dns";C="White"}
         [pscustomobject]@{T="====================================";C="Cyan"}
         [pscustomobject]@{T="  1 - Сетевой монитор";C="White"}
         [pscustomobject]@{T="  2 - Проверка доменов (lists\)";C="White"}
         [pscustomobject]@{T="  3 - Планировщик задач";C="White"}
+        [pscustomobject]@{T="  4 - DNS-проверка (подмена)";C="White"}
         [pscustomobject]@{T="  6 - Одиночная проверка";C="White"}
         [pscustomobject]@{T="  7 - Руководство";C="White"}
         [pscustomobject]@{T="  9 - Сертификаты$certs";C="White"}
@@ -1280,10 +1415,12 @@ function Show-IPInfo {
         [pscustomobject]@{T="  Local IP   : $local";C="White"}
         [pscustomobject]@{T="  External IP: $external";C="White"}
         [pscustomobject]@{T="  Geo        : $geo";C="White"}
+        [pscustomobject]@{T="  DNS        : $dns";C="White"}
         [pscustomobject]@{T="====================================";C="Cyan"}
         [pscustomobject]@{T="  1 - Network Monitor";C="White"}
         [pscustomobject]@{T="  2 - Domain scan (lists\)";C="White"}
         [pscustomobject]@{T="  3 - Task Scheduler";C="White"}
+        [pscustomobject]@{T="  4 - DNS check (spoof)";C="White"}
         [pscustomobject]@{T="  6 - Single check";C="White"}
         [pscustomobject]@{T="  7 - Manual";C="White"}
         [pscustomobject]@{T="  9 - Certificates$certs";C="White"}
@@ -1634,21 +1771,11 @@ function Check-Single {
         Write-Host "HTTP   : $http"
         $logLines.Add("HTTP   : $http")
 
-        # Итоговый статус
-        $certTrust = if ($cert) { $cert.Trust } else { "FAIL" }
-        $status = "DOWN"
-        if ($http -match "^(2|3)" -and $certTrust -eq "TRUSTED") { $status = "UP" }
-        elseif ($http -match "^(2|3)" -and $certTrust -ne "TRUSTED") { $status = "DEGRADED" }
-        elseif ($dns -eq "OK" -and ($cert.TLS -eq "OK" -or $p.Loss -lt 100)) { $status = "DEGRADED" }
-
-        $color = switch ($status) {
-            "UP"       { "Green" }
-            "DEGRADED" { "Yellow" }
-            "DOWN"     { "Red" }
-            default    { "White" }
-        }
-        Write-Host "$(T 'StatusLbl') : $status" -ForegroundColor $color
-        $logLines.Add("$(T 'StatusLbl') : $status")
+        # Итоговый вывод простым языком (тот же классификатор, что и в таблицах)
+        $v     = Get-Verdict $dns $cert.TLS $http $cert
+        $color = Get-VerdictColor $v.Class
+        Write-Host "$(T 'VerdictLbl') : $($v.Label)" -ForegroundColor $color
+        $logLines.Add("$(T 'VerdictLbl') : $($v.Label)")
         $logLines.Add("")   # пустая строка между доменами
     }
 
@@ -1658,6 +1785,141 @@ function Check-Single {
     $key = Read-Host " "
     if ($key -eq "S" -or $key -eq "s" -or $key -eq "с" -or $key -eq "С") {
         Save-Log -Type "Single" -Content ($logLines -join "`n") `
+            -ExternalIP $global:CachedExternalIP -Geo $global:CachedGeo
+    }
+}
+
+
+# ============================================================
+# DNS-ПРОВЕРКА (v1.14.8) — пункт 4
+# Резолвит домен через системный DNS, публичные (1.1.1.1, 8.8.8.8), любые
+# КАСТОМНЫЕ серверы — и сравнивает с DoH-ЭТАЛОНОМ (DNS поверх HTTPS, порт 443).
+# DoH нельзя прозрачно перехватить на порту 53, поэтому он — «правда». Если
+# plaintext-ответ расходится с DoH → это перехват/подмена. Показывает задержку.
+# ============================================================
+function Get-AviaDns {
+    # Массив IPv4 A-записей через plaintext DNS (UDP 53). $server пуст = системный.
+    param([string]$domain, [string]$server)
+    try {
+        $p = @{ Name=$domain; Type='A'; DnsOnly=$true; NoHostsFile=$true; ErrorAction='Stop' }
+        if ($server) { $p.Server = $server; $p.QuickTimeout = $true }
+        $r = Resolve-DnsName @p
+        return ,@($r | Where-Object { $_.Type -eq 'A' } |
+                  Select-Object -ExpandProperty IPAddress -Unique | Sort-Object)
+    } catch { return ,@() }
+}
+
+function Resolve-Doh {
+    # Эталон: A-записи через DoH (HTTPS/443) — Google, затем Cloudflare как фолбэк.
+    param([string]$domain)
+    $eps = @(
+        @{ Url = "https://dns.google/resolve?name=$domain&type=A";        Hdr = @{} },
+        @{ Url = "https://cloudflare-dns.com/dns-query?name=$domain&type=A"; Hdr = @{ accept = 'application/dns-json' } }
+    )
+    foreach ($e in $eps) {
+        try {
+            $r = Invoke-RestMethod $e.Url -Headers $e.Hdr -TimeoutSec 6 -ErrorAction Stop
+            $ips = @($r.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { $_.data } |
+                     Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -Unique | Sort-Object)
+            if ($ips.Count -gt 0) { return ,$ips }
+        } catch {}
+    }
+    return ,@()
+}
+
+function Show-DnsCheck {
+    $ru = ($global:Lang -ne "EN")
+    Write-Host ("  === " + $(if($ru){"DNS-проверка (plaintext vs DoH-эталон)"}else{"DNS check (plaintext vs DoH truth)"}) + " ===") -ForegroundColor Cyan
+    Write-Host ""
+    $inputStr = Read-Host "  $(T 'Domains')"
+    if (-not $inputStr) { return }
+    $domains = $inputStr -split ',' | ForEach-Object { Sanitize-Domain $_ } | Where-Object { $_ }
+    if (-not $domains) { return }
+
+    # Кастомные DNS-серверы (опционально)
+    Write-Host ("  " + $(if($ru){"Доп. DNS-серверы через запятую (Enter — только стандартные):"}else{"Extra DNS servers, comma-separated (Enter for defaults):"})) -ForegroundColor DarkGray
+    $customRaw = Read-Host "  DNS"
+    $customs = @($customRaw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+
+    # Список резолверов: системный + публичные + кастомные
+    $resolvers = New-Object System.Collections.Generic.List[object]
+    $resolvers.Add(@{ Name = $(if($ru){"Система"}else{"System"}); Server = "" })
+    $resolvers.Add(@{ Name = "1.1.1.1"; Server = "1.1.1.1" })
+    $resolvers.Add(@{ Name = "8.8.8.8"; Server = "8.8.8.8" })
+    foreach ($c in $customs) { $resolvers.Add(@{ Name = $c; Server = $c }) }
+
+    $fmt = {
+        param($arr)
+        if (-not $arr -or @($arr).Count -eq 0) { return "—" }
+        $a = @($arr)
+        if ($a.Count -le 3) { return ($a -join ", ") }
+        return (($a[0..2] -join ", ") + ", …(+$($a.Count-3))")
+    }
+
+    Write-Host ("  " + $(if($ru){"Резолвлю (DoH-эталон + plaintext)..."}else{"Resolving (DoH truth + plaintext)..."})) -ForegroundColor DarkGray
+    Write-Host ""
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("DNS check $script:VersionTag  $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')")
+    $log.Add("Система DNS: $global:CachedDns")
+    $log.Add("")
+
+    foreach ($d in @($domains)) {
+        $truth = Resolve-Doh $d                       # эталон (DoH)
+        $hasTruth = (@($truth).Count -gt 0)
+
+        # plaintext-резолверы с замером задержки
+        $rows = foreach ($rv in $resolvers) {
+            $sw  = [System.Diagnostics.Stopwatch]::StartNew()
+            $ips = Get-AviaDns $d $rv.Server
+            $sw.Stop()
+            $clean = if ($hasTruth -and @($ips).Count -gt 0) { (@($ips) | Where-Object { $truth -contains $_ }).Count -gt 0 } else { $null }
+            [pscustomobject]@{ Name=$rv.Name; Ips=@($ips); Ms=[int]$sw.ElapsedMilliseconds; Clean=$clean }
+        }
+        $rows = @($rows)
+
+        # Вердикт по домену
+        $anyIps    = ($rows | Where-Object { $_.Ips.Count -gt 0 }).Count -gt 0
+        $poisoned  = @($rows | Where-Object { $_.Clean -eq $false })
+        $cleanOnes = @($rows | Where-Object { $_.Clean -eq $true })
+
+        if (-not $hasTruth) {
+            if (-not $anyIps) { $vt = if($ru){"не резолвится нигде"}else{"no resolution anywhere"}; $vc="DarkGray" }
+            else { $vt = if($ru){"DoH недоступен — сверка неполная"}else{"DoH unavailable — partial check"}; $vc="Yellow" }
+        }
+        elseif (-not $anyIps) {
+            $vt = if($ru){"блок: plaintext DNS молчит, DoH видит"}else{"block: plaintext silent, DoH resolves"}; $vc="Red"
+        }
+        elseif ($poisoned.Count -eq 0) {
+            $vt = if($ru){"совпадает с DoH (чисто)"}else{"matches DoH (clean)"}; $vc="Green"
+        }
+        elseif ($cleanOnes.Count -eq 0) {
+            $vt = if($ru){"ПЕРЕХВАТ DNS :53 (все plaintext ≠ DoH)"}else{"DNS HIJACK :53 (all plaintext != DoH)"}; $vc="Red"
+        }
+        else {
+            $vt = if($ru){"частичная подмена (часть резолверов врёт)"}else{"partial spoof (some resolvers lie)"}; $vc="Red"
+        }
+
+        # Вывод
+        Write-Host "  $d" -ForegroundColor Cyan
+        Write-Host ("    {0,-14}: {1}" -f "DoH (эталон)", (& $fmt $truth)) -ForegroundColor White
+        $log.Add($d); $log.Add("  DoH(эталон) : $(& $fmt $truth)")
+        foreach ($row in $rows) {
+            $mark = ""; $col = "DarkGray"
+            if ($row.Clean -eq $true)  { $col = "Green" }
+            if ($row.Clean -eq $false) { $col = "Red"; $mark = if($ru){"  ≠DoH"}else{"  !=DoH"} }
+            Write-Host ("    {0,-14}: {1}   ({2} ms){3}" -f $row.Name, (& $fmt $row.Ips), $row.Ms, $mark) -ForegroundColor $col
+            $log.Add(("  {0,-12}: {1}  ({2} ms){3}" -f $row.Name, (& $fmt $row.Ips), $row.Ms, $mark))
+        }
+        Write-Host ("    -> $vt") -ForegroundColor $vc
+        Write-Host ""
+        $log.Add("  -> $vt"); $log.Add("")
+    }
+
+    Write-Host "  $(T 'SaveHint')" -ForegroundColor DarkGray
+    $key = Read-Host " "
+    if ($key -eq "S" -or $key -eq "s" -or $key -eq "с" -or $key -eq "С") {
+        Save-Log -Type "DNS" -Content ($log -join "`n") `
             -ExternalIP $global:CachedExternalIP -Geo $global:CachedGeo
     }
 }
@@ -1695,6 +1957,7 @@ NetworkChecker $script:VersionTag — Лог проверки
 Тип        : $Type
 External IP: $ExternalIP
 Geo        : $Geo
+DNS        : $global:CachedDns
 =====================================
 
 $Content
@@ -1733,6 +1996,7 @@ function Check-List-WithLog {
     Write-Host "  $(T 'DomainsCount'): $total" -ForegroundColor DarkGray
 
     $logLines = [System.Collections.Generic.List[string]]::new()
+    $rows = [System.Collections.Generic.List[object]]::new()
     $idx = 0
 
     foreach ($d in $domains) {
@@ -1745,39 +2009,17 @@ function Check-List-WithLog {
         # Без этого хвосты длинных доменов остаются на экране при переходе к коротким.
         Write-Host ("`r  [$bar] $pctN%  {0,-40}" -f $d) -NoNewline -ForegroundColor DarkGray
         $r = Test-Domain $d
+        $rows.Add($r)
 
-        $color = switch ($r.Status) {
-            "UP"       { "Green" }
-            "DEGRADED" { "Yellow" }
-            "DOWN"     { "Red" }
-            default    { "White" }
-        }
-        # v1.5: синий для TRUSTED (File/CDN) — Arbitration
-        if ($r.Cert -like "*TRUSTED (File)*") { $color = "Cyan" }
-        if ($r.Cert -like "*TRUSTED (CDN)*")  { $color = "DarkCyan" }
-
-        # HTTP-поле -13: вмещает самые длинные значения FAIL(timeout)/FAIL(TLS-err),
-        # иначе они распирали строку и колонка IP «уезжала» вправо.
-        $line = ("{0,-25} {1,-10} DNS:{2,-4} TLS:{3,-4} HTTP:{4,-13} PING:{5,-10} LOSS:{6,-6} CERT:{7,-20} IP:{8}" -f `
-            $r.Domain, $r.Status, $r.DNS, $r.TLS, $r.HTTP, $r.Ping, $r.Loss, $r.Cert, $r.IP)
+        $color = Get-VerdictColor $r.VClass
+        $line  = Format-ResultRow $r
 
         Write-Host "`r" -NoNewline  # очищаем строку прогресса
         Write-Host $line -ForegroundColor $color
         $logLines.Add($line)
     }
 
-    # v1.5: Summary — итоговая строка
-    $results = @($logLines)
-    $cntUp   = ($results | Where-Object { $_ -match ' UP ' }).Count
-    $cntDeg  = ($results | Where-Object { $_ -match ' DEGRADED ' }).Count
-    $cntDown = ($results | Where-Object { $_ -match ' DOWN ' }).Count
-    $pings   = $results | ForEach-Object {
-        if ($_ -match 'PING:(\d+)') { [int]$Matches[1] }
-    } | Where-Object { $_ }
-    $avgPing = if ($pings) { [int](($pings | Measure-Object -Average).Average) } else { 0 }
-    Write-Host ""
-    Write-Host ("  $(T 'Summary'): {0}  UP={1}  DEGRADED={2}  DOWN={3}  Avg Ping={4}ms" -f `
-        @($domains).Count, $cntUp, $cntDeg, $cntDown, $avgPing) -ForegroundColor Cyan
+    Write-ResultSummary $rows
 
     # AutoSave — для авто-режима (-RunList / Планировщик): сохраняем без запроса.
     if ($AutoSave) {
@@ -2043,6 +2285,13 @@ function Show-Manual {
         Write-Host "      Прогресс отображается полосой: [████████░░░░] 60%"
         Write-Host "      После завершения: нажми S для сохранения лога в Logs\"
         Write-Host ""
+        Write-Host "  4 — DNS-проверка (детект подмены/перехвата)" -ForegroundColor White
+        Write-Host "      Резолвит домен(ы) через системный/публичные/свои DNS и сверяет"
+        Write-Host "      с DoH-эталоном (DNS поверх HTTPS — его не перехватить на порту 53)."
+        Write-Host "      plaintext ≠ DoH → перехват/подмена. Можно указать свои DNS-серверы."
+        Write-Host "      Показывает задержку: быстрый ответ «1.1.1.1» (2-6мс) = локальный перехват."
+        Write-Host "      Отличает DNS-блок от DPI-блока в канале."
+        Write-Host ""
         Write-Host "  3 — Планировщик задач (авто-проверка)" -ForegroundColor White
         Write-Host "      Создаёт задачу Windows (schtasks), которая раз в день сама"
         Write-Host "      проверяет выбранный список и пишет отчёт в Logs\ — без участия"
@@ -2072,7 +2321,19 @@ function Show-Manual {
         Write-Host "  ─────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "  Каждая строка в таблице выглядит так:"
-        Write-Host "   domain.ru   STATUS   DNS:OK  TLS:OK  HTTP:200  PING:25ms  CERT:TRUSTED  IP:..." -ForegroundColor DarkGray
+        Write-Host "   domain.ru   ВЫВОД   DNS:OK  TLS:OK  HTTP:200  PING:25ms  CERT:TRUSTED  IP:..." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  ВЫВОД (1-я колонка) — итог простым языком:" -ForegroundColor White
+        Write-Host "   Доступен       — работает (зелёный)"
+        Write-Host "   Без страницы   — достижим, но не отдаёт страницу (404/403/429/503)"
+        Write-Host "                    — это НЕ блок, просто у домена нет веб-страницы"
+        Write-Host "   Блок DPI/RST   — соединение режется (DPI)"
+        Write-Host "   Блок TLS       — рукопожатие не проходит (таймаут/сброс)"
+        Write-Host "   Заглушка       — валидный серт на чужое имя + фейл = редирект на стаб"
+        Write-Host "   MITM-перехват  — недоверенный серт на чужое имя"
+        Write-Host "   Нет DNS-записи  — домен не резолвится (часто норма для apex/инфра)"
+        Write-Host ""
+        Write-Host "  Дальше идёт техсырьё (для деталей):" -ForegroundColor White
         Write-Host ""
         Write-Host "  DNS — получен ли IP-адрес домена" -ForegroundColor White
         Write-Host "   DNS:OK   — домен успешно резолвится"
@@ -2196,6 +2457,12 @@ function Show-Manual {
         Write-Host "            интеграция с Планировщиком задач, фикс -DebugMode" -ForegroundColor DarkGray
         Write-Host "  v1.14.5   Точный вердикт серта: MITM только при недовер. цепочке +" -ForegroundColor DarkGray
         Write-Host "            чужом имени; убраны ложные MITM на CDN; сводная таблица all" -ForegroundColor DarkGray
+        Write-Host "  v1.14.6   Колонка-вывод простым языком, приглушены ложные тревоги," -ForegroundColor DarkGray
+        Write-Host "            детект заглушки, показ текущих DNS-серверов в шапке" -ForegroundColor DarkGray
+        Write-Host "  v1.14.7   DNS-проверка (сравнение резолверов, детект подмены)," -ForegroundColor DarkGray
+        Write-Host "            фикс вердикта: HTTP:200 побеждает флап TLS-пробы" -ForegroundColor DarkGray
+        Write-Host "  v1.14.8   DNS: DoH-эталон (детект перехвата :53), кастомные DNS," -ForegroundColor DarkGray
+        Write-Host "            задержка по каждому резолверу" -ForegroundColor DarkGray
         Write-Host ""
 
     } else {
@@ -2225,6 +2492,7 @@ function Show-Manual {
         Write-Host "  1 — Live network monitor (Q-quit S-sort F-filter P-pause)"
         Write-Host "  2 — Scan domain lists ('all'/multi = one combined table, dedup)"
         Write-Host "  3 — Task Scheduler: daily auto-scan (schtasks, no service)"
+        Write-Host "  4 — DNS check: plaintext vs DoH truth, custom servers, latency"
         Write-Host "  6 — Single deep check: google.com,vk.com"
         Write-Host "  7 — This manual"
         Write-Host "  9 — Certificate manager (Smart Arbitration)"
@@ -2308,6 +2576,7 @@ function Check-CombinedLists {
     Write-Host ("  $(T 'DomainsCount'): $($domains.Count)") -ForegroundColor DarkGray
 
     $logLines = [System.Collections.Generic.List[string]]::new()
+    $rows = [System.Collections.Generic.List[object]]::new()
     $total = $domains.Count
     $idx = 0
     foreach ($d in $domains) {
@@ -2317,27 +2586,16 @@ function Check-CombinedLists {
         $pctN = [int]($idx / $total * 100)
         Write-Host ("`r  [$bar] $pctN%  {0,-40}" -f $d) -NoNewline -ForegroundColor DarkGray
         $r = Test-Domain $d
+        $rows.Add($r)
 
-        $color = switch ($r.Status) { "UP" {"Green"} "DEGRADED" {"Yellow"} "DOWN" {"Red"} default {"White"} }
-        if ($r.Cert -like "*TRUSTED (File)*") { $color = "Cyan" }
-        if ($r.Cert -like "*TRUSTED (CDN)*")  { $color = "DarkCyan" }
-
-        $line = ("{0,-25} {1,-10} DNS:{2,-4} TLS:{3,-4} HTTP:{4,-13} PING:{5,-10} LOSS:{6,-6} CERT:{7,-20} IP:{8}" -f `
-            $r.Domain, $r.Status, $r.DNS, $r.TLS, $r.HTTP, $r.Ping, $r.Loss, $r.Cert, $r.IP)
+        $color = Get-VerdictColor $r.VClass
+        $line  = Format-ResultRow $r
         Write-Host "`r" -NoNewline
         Write-Host $line -ForegroundColor $color
         $logLines.Add($line)
     }
 
-    $results = @($logLines)
-    $cntUp   = ($results | Where-Object { $_ -match ' UP ' }).Count
-    $cntDeg  = ($results | Where-Object { $_ -match ' DEGRADED ' }).Count
-    $cntDown = ($results | Where-Object { $_ -match ' DOWN ' }).Count
-    $pings   = $results | ForEach-Object { if ($_ -match 'PING:(\d+)') { [int]$Matches[1] } } | Where-Object { $_ }
-    $avgPing = if ($pings) { [int](($pings | Measure-Object -Average).Average) } else { 0 }
-    Write-Host ""
-    Write-Host ("  $(T 'Summary'): {0}  UP={1}  DEGRADED={2}  DOWN={3}  Avg Ping={4}ms" -f `
-        $results.Count, $cntUp, $cntDeg, $cntDown, $avgPing) -ForegroundColor Cyan
+    Write-ResultSummary $rows
 
     Write-Host ""
     Write-Host "  $(T 'SaveHint')" -ForegroundColor DarkGray
@@ -2559,6 +2817,7 @@ if ($RunList) {
 Write-Host "  Получаем сетевые данные..." -ForegroundColor DarkGray
 $global:CachedExternalIP = Get-ExternalIP
 $global:CachedGeo        = Get-Geo $global:CachedExternalIP
+$global:CachedDns        = Get-DnsServers
 Test-TimeDrift   # Один раз при запуске — проверяем дрейф часов
 
 # Основной цикл меню — IP/Geo больше не запрашиваются повторно
@@ -2575,6 +2834,7 @@ do {
         "1"  { Show-NetMonitor }
         "2"  { Invoke-MultiList }
         "3"  { Manage-Schedule }
+        "4"  { Show-DnsCheck }
         "6"  { Check-Single }
         "7"  { Show-Manual }
         # 8 — переключение языка RU⇄EN (без перезапуска, мгновенно)
