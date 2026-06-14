@@ -22,7 +22,10 @@
 - `Sanitize-Domain` ужесточён: битый ввод вида `://google.com`, `:`, `-` больше
   не уходит в DNS-резолв; добавлена валидация домена.
 - Очищены списки `lists/google.txt` и `lists/services.txt` (мусор и дубликаты).
+- Список Telegram переименован `телеграмм.txt` → `lists/telegram.txt`.
 - Удобный запуск: `NetworkChecker.bat` (двойной клик).
+- Документация собрана в каталог `docs/` (`OVERVIEW.md`, `MANUAL.md`,
+  `TECHNICAL.md`, `BUGS_AND_FIXES.md`, `CHANGELOG.md`); `README.md` остался в корне.
 
 ## v1.14.2
 
