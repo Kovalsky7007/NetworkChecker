@@ -102,7 +102,7 @@ DNS → TCP → TLS → CERT → HTTP
 
 ```
 NetworkChecker.bat         — удобный запуск (двойной клик)
-NetworkChecker_v1_14.ps1   — сам скрипт (вся логика)
+NetworkChecker.ps1         — сам скрипт (вся логика)
 lists\                     — списки доменов (.txt, один домен на строку)
 Logs\                      — отчёты (создаётся автоматически)
 Certs\                     — .cer для Smart Arbitration

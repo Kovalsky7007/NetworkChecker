@@ -8,9 +8,3 @@ ebay.com
 apple.com
 icloud.com
 mzstatic.com
-netflix.com
-nflxvideo.net
-spotify.com
-scdn.co
-twitch.tv
-ttvnw.net

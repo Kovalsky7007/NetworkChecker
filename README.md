@@ -68,16 +68,24 @@ sberbank.ru   DEGRADED  DNS:OK  TLS:OK  HTTP:FAIL(RST)  CERT:MITM
 
 Альтернативы:
 
-* ПКМ по `NetworkChecker_v1_14.ps1` → **Запустить с помощью PowerShell**
+* ПКМ по `NetworkChecker.ps1` → **Запустить с помощью PowerShell**
 * или из консоли:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File NetworkChecker_v1_14.ps1
+powershell -ExecutionPolicy Bypass -File NetworkChecker.ps1
 ```
 
-> ⚠️ Имя скрипта — с подчёркиваниями: `NetworkChecker_v1_14.ps1`.
 > Если PowerShell ругается на политику выполнения — используйте `.bat` или флаг
 > `-ExecutionPolicy Bypass`, как выше.
+
+**Авто-режим (без меню)** — для Планировщика задач или ручного запуска по расписанию:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File NetworkChecker.ps1 -RunList all -Quiet
+```
+
+Проверит список(и) из `lists\` и сохранит отчёт в `Logs\` без интерактива.
+Настроить ежедневный автозапуск проще через меню — пункт **3 (Планировщик задач)**.
 
 ---
 
@@ -86,7 +94,8 @@ powershell -ExecutionPolicy Bypass -File NetworkChecker_v1_14.ps1
 | Пункт | Действие                                                            |
 | ----- | ------------------------------------------------------------------ |
 | `1`   | Сетевой монитор — живые TCP/UDP соединения (`Q`-выход `S`-сорт `F`-фильтр `P`-пауза) |
-| `2`   | Проверка списков доменов из `lists\` (номера через запятую / `all`) |
+| `2`   | Проверка списков доменов из `lists\` — `all` или несколько номеров дают **одну сводную таблицу** (с дедупом), один номер — подробный разбор файла |
+| `3`   | Планировщик задач — ежедневный авто-скан через `schtasks` (без служб) |
 | `6`   | Одиночная проверка одного или нескольких доменов                   |
 | `7`   | Руководство пользователя                                           |
 | `8`   | Переключить язык RU ⇄ EN                                            |
@@ -104,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File NetworkChecker_v1_14.ps1
 
 ```
 NetworkChecker.bat         — удобный запуск (двойной клик)
-NetworkChecker_v1_14.ps1   — сам скрипт
+NetworkChecker.ps1         — сам скрипт
 lists\                     — списки доменов (.txt, один домен на строку)
 Logs\                      — отчёты (создаётся автоматически)
 Certs\                     — .cer для Smart Arbitration
@@ -128,6 +137,25 @@ vk.com
 # строки с # — комментарии, игнорируются
 sberbank.ru
 ```
+
+### Какие списки есть
+
+| Список | Что внутри |
+| ------ | ---------- |
+| `google.txt` | сервисы и инфраструктура Google (вкл. YouTube) |
+| `yandex.txt` | экосистема Яндекса |
+| `telegram.txt` | Telegram: core, ДЦ, CDN, клиенты |
+| `social.txt` | соцсети и мессенджеры (кроме Telegram) |
+| `streaming.txt` | зарубежные видео/музыка (Netflix, Twitch, Spotify…) |
+| `media_ru.txt` | российские медиа (Rutube, Kinopoisk, ivi, Okko…) |
+| `services.txt` | зарубежные сервисы и e-commerce (Apple, Amazon, AliExpress…) |
+| `CDN_global.txt` | глобальные CDN (Cloudflare, Akamai, Fastly…) |
+| `global_status.txt` | сводный быстрый чек глобальной доступности |
+| `russia_status.txt` | сводный быстрый чек доступности рунета |
+
+> Каждый домен лежит ровно в одном тематическом списке. Два `*_status.txt` —
+> это сводные «быстрые чеки» и **намеренно** повторяют популярные домены из
+> тематических списков (помечено в шапке файла).
 
 ---
 

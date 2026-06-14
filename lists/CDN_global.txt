@@ -2,5 +2,6 @@ fastly.net
 cloudflare.com
 cloudfront.net
 akamai.net
+akamaihd.net
 edgecastcdn.net
 bunnycdn.com

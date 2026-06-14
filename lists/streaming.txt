@@ -1,7 +1,4 @@
-youtube.com
 youtubei.googleapis.com
-googlevideo.com
-ytimg.com
 twitch.tv
 ttvnw.net
 netflix.com
@@ -9,6 +6,7 @@ nflxvideo.net
 disneyplus.com
 hbo.com
 spotify.com
+scdn.co
 deezer.com
 soundcloud.com
 appletv.com

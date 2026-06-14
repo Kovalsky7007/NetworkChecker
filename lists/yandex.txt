@@ -27,7 +27,6 @@ market.yandex.ru
 mkt.yandex.net
 music.yandex.ru
 music.yandex.net
-kinopoisk.ru
 ott.yandex.net
 strm.yandex.net
 tv.yandex.ru

@@ -1,3 +1,5 @@
+# Быстрый чек доступности рунета — по одному представителю на сервис.
+# Намеренно повторяет популярные домены из тематических списков (media_ru и др.).
 yandex.ru
 yastatic.net
 vk.com
@@ -12,8 +14,6 @@ st.ozon.ru
 wildberries.ru
 images.wbstatic.net
 rutube.ru
-p-v.rutube.ru
-wink.ru
 avito.ru
 tbank.ru
 rbc.ru

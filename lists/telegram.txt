@@ -16,3 +16,4 @@ flora.web.telegram.org
 # === CDN / клиенты ===
 cdn-telegram.org
 desktop.telegram.org
+tdesktop.com

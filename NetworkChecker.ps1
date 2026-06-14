@@ -82,10 +82,24 @@
 # ============================================================
 
 param(
-    [switch]$DebugMode   # Запуск с -DebugMode включает Verbose-лог (Debug-окно)
+    [switch]$DebugMode,  # Запуск с -DebugMode включает Verbose-лог (Debug-окно)
+    [string]$RunList,    # Авто-режим: имя файла из lists\ (или 'all') для проверки без меню
+    [switch]$Quiet       # Тихий режим для планировщика: без интерактива, лог пишется в Logs\
 )
 
-# Если передан флаг -DebugMode при запуске — активируем Verbose-вывод сразу
+# ============================================================
+# ВЕРСИЯ — единый источник истины. Меняй ТОЛЬКО здесь при релизе.
+# Используется в меню, шапках отчётов, логах и Руководстве.
+# (В комментариях-истории версии оставлены как есть — это хронология.)
+# ============================================================
+$script:Version    = "1.14.5"
+$script:VersionTag = "v$script:Version"
+
+# Если передан флаг -DebugMode при запуске — активируем Verbose-вывод сразу.
+# FIX: раньше выставлялся только $VerbosePreference, а $global:DebugMode оставался
+# $null — из-за этого метка [DEBUG] в меню не показывалась, а пункт 10
+# переключался «от пустого значения». Синхронизируем глобальный флаг сразу.
+$global:DebugMode = [bool]$DebugMode
 if ($DebugMode) {
     $VerbosePreference = "Continue"
 }
@@ -108,7 +122,12 @@ function Write-Verbose {
 # ==============================
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
     try {
-        Start-Process powershell.exe "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -ErrorAction Stop
+        # FIX: пробрасываем параметры при повышении прав, иначе они терялись при UAC.
+        $fwd = ""
+        if ($DebugMode) { $fwd += " -DebugMode" }
+        if ($RunList)   { $fwd += " -RunList `"$RunList`"" }
+        if ($Quiet)     { $fwd += " -Quiet" }
+        Start-Process powershell.exe "-ExecutionPolicy Bypass -File `"$PSCommandPath`"$fwd" -Verb RunAs -ErrorAction Stop
     } catch {
         Write-Host "Не удалось получить права администратора: $($_.Exception.Message)" -ForegroundColor Red
         Read-Host "Enter для выхода"
@@ -134,7 +153,7 @@ $global:Lang = "RU"
 $global:ShowLegend = $true
 $global:T = @{
     RU = @{
-        MenuTitle    = "NetworkChecker v1.14 — Master Release"
+        MenuTitle    = "NetworkChecker $script:VersionTag — Master Release"
         M1 = "1 - Сетевой монитор"; M2 = "2 - Russia / Foreign / Streaming / Custom / all"
         M6 = "6 - Одиночная проверка"; M7 = "7 - Руководство"
         M8 = "8 - Switch to English"; M9 = "9 - Сертификаты"
@@ -146,9 +165,23 @@ $global:T = @{
         Domains  = "Домен(ы)"; PingCount = "Пингов (Enter=10)"
         EnterBack = "Enter — меню"
         CertsActive = "активен"
+        PingPrompt = "Количество пингов для медианы [по умолчанию 10]:"
+        PingInput  = "Количество (Enter = 10)"
+        StatusLbl  = "Статус"
+        DownDNS    = "DOWN (DNS не прошёл)"
+        ListPrompt = "Введите номер(а) через запятую или 'all' для всех:"
+        ListHint   = "Пример: 1,3  или  all  или  0 для отмены"
+        Cancel     = "Выбор"
+        Pinging    = "Пингую"
+        PingTimes  = "раз..."
+        PingDone   = " готово"
+        Days       = "дней"
+        MitmWarn1  = "  ⚠ MITM: Сертификат не совпадает с доменом!"
+        MitmWarn2  = "    Возможно: подмена провайдером или антивирус перехватывает трафик"
+        LogSaved   = "  Лог сохранён: Logs\"
     }
     EN = @{
-        MenuTitle    = "NetworkChecker v1.14 — Master Release"
+        MenuTitle    = "NetworkChecker $script:VersionTag — Master Release"
         M1 = "1 - Network Monitor"; M2 = "2 - Russia / Foreign / Streaming / Custom / all"
         M6 = "6 - Single check"; M7 = "7 - User Manual"
         M8 = "8 - Переключить на Русский"; M9 = "9 - Certificates"
@@ -160,6 +193,20 @@ $global:T = @{
         Domains  = "Domain(s)"; PingCount = "Ping count (Enter=10)"
         EnterBack = "Enter — menu"
         CertsActive = "active"
+        PingPrompt = "Number of pings for the median [default 10]:"
+        PingInput  = "Count (Enter = 10)"
+        StatusLbl  = "Status"
+        DownDNS    = "DOWN (DNS failed)"
+        ListPrompt = "Enter number(s) separated by commas or 'all':"
+        ListHint   = "Example: 1,3  or  all  or  0 to cancel"
+        Cancel     = "Choice"
+        Pinging    = "Pinging"
+        PingTimes  = "times..."
+        PingDone   = " done"
+        Days       = "days"
+        MitmWarn1  = "  ⚠ MITM: certificate does not match the domain!"
+        MitmWarn2  = "    Possibly ISP spoofing or antivirus intercepting traffic"
+        LogSaved   = "  Log saved: Logs\"
     }
 }
 function T { param([string]$k); $global:T[$global:Lang][$k] }
@@ -317,6 +364,9 @@ function Sanitize-Domain {
 # ==============================
 # ВНЕШНИЙ IP
 # ==============================
+# "ms" только к числовому значению; для timeout/N/A — без единиц измерения.
+function Format-Ms { param($v); if ("$v" -match '^\d') { "$v ms" } else { "$v" } }
+
 function Get-ExternalIP {
     # v1.4: fallback на 2 сервиса + Verbose (GPT ревью)
     try {
@@ -402,34 +452,16 @@ function Get-GeoCode {
 # v1.5 [Claude+Google AI]: считаем разницу BytesSent+BytesReceived между тиками
 # Используем Get-NetAdapterStatistics если Get-Counter недоступен
 # ==============================
-$global:_PrevProcNet = @{}
-$global:_PrevNetTime = $null
-
 function Get-NetSpeed {
-    # Возвращаем хэштейл: processName.ToLower() → KB/s (int)
-    $result = @{}
-    try {
-        $now = Get-Date
-        # Get-Process даёт WorkingSet, но не сетевой трафик напрямую.
-        # Используем performance counters если доступны, иначе заглушка.
-        # На большинстве систем достаточно показать "-" для процессов без данных.
-        $procs = Get-Process -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
-            # Считаем приблизительно через разницу IO если предыдущий тик есть
-            $key = "$($p.Id)"
-            if ($global:_PrevProcNet.ContainsKey($key) -and $global:_PrevNetTime) {
-                $dt = ($now - $global:_PrevNetTime).TotalSeconds
-                if ($dt -gt 0) {
-                    $byteDiff = [Math]::Max(0, $p.WorkingSet64 - $global:_PrevProcNet[$key])
-                    # WorkingSet — не трафик, но даёт сигнал активности
-                    # Реальный трафик через WMI/perf слишком медленный для 3-сек тика
-                }
-            }
-            $global:_PrevProcNet[$key] = $p.WorkingSet64
-        }
-        $global:_PrevNetTime = $now
-    } catch {}
-    return $result   # Пустой хэш — монитор покажет "-" для KB/s, это корректно
+    # Возвращает хэш processName.ToLower() → KB/s. Сейчас всегда пустой —
+    # монитор показывает "-" в колонке KB/s, и это корректно (см. док.
+    # «Известные ограничения»). Реальный per-process трафик доступен только
+    # через ETW/perf-счётчики, которые слишком медленны для 3-секундного тика.
+    #
+    # Прежняя версия каждый тик перебирала ВСЕ процессы и складывала WorkingSet64
+    # в глобальный хеш, который нигде не читался — лишняя работа без результата.
+    # Оставлена честная заглушка; точку расширения см. в BUGS_AND_FIXES.md.
+    return @{}
 }
 
 
@@ -513,6 +545,47 @@ function Get-PingStats {
 #   — X509Chain через ChainStatus (GPT)
 #   — Поле Reason (GPT)
 # ==============================
+# ==============================
+# СОВПАДЕНИЕ ИМЕНИ СЕРТИФИКАТА С ДОМЕНОМ (v1.14.5)
+# Корректная проверка hostname: CN + все DNS-имена из SAN, с правилами wildcard
+# (*.example.com покрывает ровно ОДИН лейбл слева). SAN читаем по OID 2.5.29.17
+# и берём значение после '=' — метка ("DNS Name"/"DNS-имя") локализована, а само
+# имя нет, поэтому работает на любой локали Windows.
+# ==============================
+function Test-HostnameMatch {
+    param(
+        [string]$Domain,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert
+    )
+    $dom = $Domain.ToLower().TrimEnd('.')
+    $names = New-Object System.Collections.Generic.List[string]
+
+    if ($Cert.Subject -match 'CN=([^,]+)') { [void]$names.Add($Matches[1].Trim()) }
+
+    $san = $Cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' }
+    if ($san) {
+        foreach ($part in ($san.Format($false) -split ',')) {
+            $v = $part.Trim()
+            if ($v -match '=(.+)$') { $v = $Matches[1].Trim() }   # снимаем локализованную метку
+            if ($v -match '\.' -and $v -match '^[*A-Za-z0-9.\-]+$') { [void]$names.Add($v) }
+        }
+    }
+
+    foreach ($n in $names) {
+        $name = $n.ToLower().TrimEnd('.')
+        if ($name -eq $dom) { return $true }
+        if ($name.StartsWith('*.')) {
+            $base = $name.Substring(2)
+            if ($dom -eq $base) { return $true }
+            if ($dom.EndsWith('.' + $base)) {
+                $left = $dom.Substring(0, $dom.Length - $base.Length - 1)
+                if ($left -and $left -notmatch '\.') { return $true }  # wildcard = один лейбл
+            }
+        }
+    }
+    return $false
+}
+
 function Get-CertInfo {
     param(
         [string]$Domain,
@@ -529,7 +602,8 @@ function Get-CertInfo {
         Trust    = "FAIL"
         Reason   = "Unknown"
         Error    = $null
-        CdnCert  = $false
+        CdnCert  = $false   # серт «того же владельца» (база CN = база домена) → TRUSTED (CDN)
+        AltName  = $false   # валидный публичный серт, но на ЧУЖОЕ имя → TRUSTED* (CDN или редирект)
     }
 
     $tcpClient = New-Object System.Net.Sockets.TcpClient
@@ -655,125 +729,87 @@ function Get-CertInfo {
 
         Write-Verbose "[$Domain] Cert: $($cert.Subject) expires $($result.Expiry)"
 
-        # 5. [Google AI] MITM ДЕТЕКЦИЯ — CN vs Domain
-        # Если провайдер подменяет сертификат — Subject не совпадёт с доменом
-        $certMatch = $false
-        if ($cert.Subject -match "CN=([^,]+)") {
-            $cn = $Matches[1].Trim()
-            Write-Verbose "[$Domain] CN=$cn"
-            # Точное совпадение
-            if ($cn -eq $Domain) {
-                $certMatch = $true
-            }
-            # Wildcard: *.example.com покрывает sub.example.com
-            elseif ($cn -match "^\*\.(.+)$") {
-                $baseDomain = $Matches[1]
-                if ($Domain -like "*.$baseDomain" -or $Domain -eq $baseDomain) {
-                    $certMatch = $true
-                }
-            }
-        }
+        # 5. ВЕРДИКТ ПО СЕРТИФИКАТУ (v1.14.5 — точная логика)
+        # Опираемся на ДВА независимых факта:
+        #   $hostMatch — имя в сертификате реально покрывает домен (CN/SAN/wildcard);
+        #   $chainOK   — цепочка строится до доверенного корня в хранилище Windows.
+        # MITM (перехват) ставим ТОЛЬКО когда имя НЕ совпало И цепочка НЕ доверена —
+        # т.е. подсунут недоверенный серт на чужое имя (стаб РКН, антивирус с своим CA).
+        # Публично доверенный серт на другое имя подделать невозможно → это CDN/
+        # фронтинг (yastatic.net через *.yandex.net), а НЕ перехват.
+        #
+        # Раньше MITM ставился по одному несовпадению имени, ДО проверки цепочки —
+        # отсюда массовые ложные MITM на CDN-доменах Яндекса/Google.
+        # [Google AI] идея MITM-детекции сохранена, но усилена доверием цепочки [Claude v1.14.5].
 
-        # SAN + CDN-сертификат проверка
-        if (-not $certMatch) {
-            $sanExtension = $cert.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
-            if ($sanExtension) {
-                $sanText = $sanExtension.Format($false)
-                # Точное совпадение домена в SAN
-                if ($sanText -match [regex]::Escape($Domain)) {
-                    $certMatch = $true
-                    Write-Verbose "[$Domain] Matched via SAN exact"
-                }
-                # Все wildcards в SAN
-                if (-not $certMatch) {
-                    $sanMatches = [regex]::Matches($sanText, "\*\.([a-z0-9\-\.]+)")
-                    foreach ($m in $sanMatches) {
-                        $sanBase = $m.Groups[1].Value
-                        if ($Domain -like "*.$sanBase" -or $Domain -eq $sanBase) {
-                            $certMatch = $true
-                            Write-Verbose "[$Domain] Matched via SAN wildcard *.$sanBase"
-                            break
-                        }
-                    }
-                }
-            }
-        }
+        $hostMatch = Test-HostnameMatch -Domain $Domain -Cert $cert
 
-        # v1.5: CDN-сертификат — CN base-name совпадает с доменом
-        # yandex.ru получает CN=*.yandex.tr — это их CDN, не MITM
-        # Логика: извлекаем 2LD из CN и домена, сравниваем
-        if (-not $certMatch -and $cert.Subject -match "CN=\*?\.?([a-z0-9\-]+)\.[a-z]+") {
-            $cnBase = $Matches[1].ToLower()
-            # Базовое имя домена (без TLD и субдоменов)
-            $domParts  = $Domain.Split('.')
-            $domBase   = if ($domParts.Count -ge 2) { $domParts[-2].ToLower() } else { $Domain.ToLower() }
+        # CDN «тот же владелец, другой TLD»: yandex.ru ↔ CN=*.yandex.com
+        if (-not $hostMatch -and $cert.Subject -match "CN=\*?\.?([a-z0-9\-]+)\.[a-z]+") {
+            $cnBase   = $Matches[1].ToLower()
+            $domParts = $Domain.Split('.')
+            $domBase  = if ($domParts.Count -ge 2) { $domParts[-2].ToLower() } else { $Domain.ToLower() }
             if ($cnBase -eq $domBase) {
-                $certMatch = $true
-                $result.CdnCert = $true   # маркер для label
-                Write-Verbose "[$Domain] CDN cert: CN base '$cnBase' matches domain base '$domBase' — TRUSTED (CDN)"
+                $hostMatch = $true
+                $result.CdnCert = $true
+                Write-Verbose "[$Domain] CDN cert: база CN '$cnBase' = база домена '$domBase'"
             }
         }
 
-        if (-not $certMatch) {
-            Write-Verbose "[$Domain] Subject mismatch — checking Certs folder"
-            # v1.5: Smart Arbitration — проверяем ./Certs перед MITM
-            $arb = Test-CertArbitration -Domain $Domain -CertSubject $cert.Subject
-            if ($arb) {
-                $result.Status = "OK"
-                $result.Trust  = $arb
-                $result.Reason = "OK"
-                Write-Verbose "[$Domain] Arbitration passed via Certs folder"
-                # не return — идём дальше проверять chain
-            } else {
-                $result.Status = "OK"
-                $result.Trust  = "MITM"
-                $result.Reason = "MITM"
-                $result.Error  = "Cert CN mismatch (possible intercept)"
-                return $result
-            }
-        }
-
-        # 6. Просроченный?
-        if ($result.DaysLeft -lt 0) {
-            $result.Status = "OK"
-            $result.Trust  = "EXPIRED"
-            $result.Reason = "Cert expired"
-            return $result
-        }
-
-        # 7. [GPT] X509Chain через ChainStatus — точная причина ошибки
+        # Доверие цепочки (revocation off — медленно и часто режется DPI).
+        # [GPT] ChainStatus — конкретная причина, а не просто FAIL.
         $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
         $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
         $chainOK = $chain.Build($cert)
-
         $isSelfSigned = ($cert.Subject -eq $cert.Issuer)
-
-        if ($isSelfSigned) {
-            $result.Status = "OK"
-            $result.Trust  = "SELF-SIGN"
-            $result.Reason = "Self-signed"
-        }
-        elseif ($chainOK) {
-            $result.Status = "OK"
-            $result.Trust  = "TRUSTED"
-            $result.Reason = "OK"
-        }
-        else {
-            # GPT: перебираем ChainStatus — конкретная причина, не просто FAIL
-            $result.Status = "OK"
-            $chainReason = "!CHAIN"
-
-            foreach ($s in $chain.ChainStatus) {
-                Write-Verbose "[$Domain] ChainStatus: $($s.Status) — $($s.StatusInformation)"
-                switch ($s.Status) {
-                    "PartialChain"  { $chainReason = "PartialChain"; break }
-                    "UntrustedRoot" { $chainReason = "UntrustedRoot"; break }
-                    "NotTimeValid"  { $chainReason = "Expired"; break }
-                    "Revoked"       { $chainReason = "Revoked"; break }
-                }
+        $chainReason  = "!CHAIN"
+        foreach ($s in $chain.ChainStatus) {
+            Write-Verbose "[$Domain] ChainStatus: $($s.Status) — $($s.StatusInformation)"
+            switch ($s.Status) {
+                "PartialChain"  { $chainReason = "PartialChain" }
+                "UntrustedRoot" { $chainReason = "UntrustedRoot" }
+                "NotTimeValid"  { $chainReason = "Expired" }
+                "Revoked"       { $chainReason = "Revoked" }
             }
-            $result.Trust  = "!CHAIN"
-            $result.Reason = $chainReason
+        }
+        Write-Verbose "[$Domain] hostMatch=$hostMatch chainOK=$chainOK selfSigned=$isSelfSigned"
+
+        # Просрочен — приоритетнее остальных вердиктов
+        if ($result.DaysLeft -lt 0) {
+            $result.Status = "OK"; $result.Trust = "EXPIRED"; $result.Reason = "Cert expired"
+            return $result
+        }
+
+        $result.Status = "OK"
+        if ($hostMatch) {
+            if ($chainOK) {
+                # Имя совпало + цепочка доверена — всё чисто.
+                $result.Trust = "TRUSTED"; $result.Reason = "OK"
+            } else {
+                # Имя верное, но корень не доверен: нац.УЦ / корп.прокси / самоподпись —
+                # это НЕ подмена идентичности. Сначала арбитраж по Certs\.
+                $arb = Test-CertArbitration -Domain $Domain -CertSubject $cert.Subject
+                if     ($arb)          { $result.Trust = $arb;       $result.Reason = "OK" }
+                elseif ($isSelfSigned) { $result.Trust = "SELF-SIGN"; $result.Reason = "Self-signed" }
+                else                   { $result.Trust = "!CHAIN";    $result.Reason = $chainReason }
+            }
+        } else {
+            # Имя НЕ совпало.
+            $arb = Test-CertArbitration -Domain $Domain -CertSubject $cert.Subject
+            if ($arb) {
+                $result.Trust = $arb; $result.Reason = "OK"
+            } elseif ($chainOK) {
+                # Публично доверенный серт на ЧУЖОЕ имя. Перехвата нет (такой серт не
+                # подделать), но это может быть как настоящий CDN, так и DNS-редирект
+                # на стаб-заглушку (напр. блок Meta на одном IP). Помечаем TRUSTED* —
+                # «валидный серт, другое имя; проверь IP и HTTP».
+                $result.AltName = $true
+                $result.Trust = "TRUSTED"; $result.Reason = "valid cert, name mismatch"
+            } else {
+                # Недоверенный серт + чужое имя → реальный перехват.
+                $result.Trust = "MITM"; $result.Reason = "MITM"
+                $result.Error = "Untrusted cert for different host (intercept)"
+            }
         }
     }
     catch {
@@ -952,11 +988,15 @@ function Test-Domain {
     # CDN проверяется первым — $cert.Trust при CDN может быть ещё не выставлен
     $certLabel = if ($cert) {
         if     ($cert.CdnCert)                { "TRUSTED (CDN)" }
+        elseif ($cert.AltName)                { "TRUSTED*" }       # валид. серт, чужое имя
         elseif ($cert.Trust -eq "TRUSTED")    { "TRUSTED" }
         elseif ($cert.Trust -like "TRUSTED *") { $cert.Trust }  # TRUSTED (File)
         elseif ($cert.Trust -eq "FAIL")       { "FAIL ($($cert.Reason))" }
         else                                  { $cert.Trust }
     } else { "N/A" }
+
+    # "ms" добавляем только к числовому пингу; у timeout/N/A единицы не нужны.
+    $pingStr = if ("$pingAvg" -match '^\d') { "$pingAvg ms" } else { "$pingAvg" }
 
     return [PSCustomObject]@{
         Domain = $domain
@@ -964,7 +1004,7 @@ function Test-Domain {
         DNS    = $dns
         TLS    = $tls
         HTTP   = $http
-        Ping   = "$pingAvg ms"
+        Ping   = $pingStr
         Loss   = "${loss}%"
         Cert   = $certLabel
         Status = $status
@@ -1131,7 +1171,8 @@ $global:LegendData = @{
         @{T="  TRUSTED       — цепочка доверия OK"; C="White"}
         @{T="  TRUSTED(CDN)  — CDN-серт, другой TLD"; C="DarkCyan"}
         @{T="  TRUSTED(File) — арбитраж через Certs\"; C="Cyan"}
-        @{T="  MITM     — CN не совпадает (перехват)"; C="Red"}
+        @{T="  TRUSTED* — валид.серт, чужое имя"; C="DarkCyan"}
+        @{T="  MITM     — недовер. серт на чужое имя"; C="Red"}
         @{T="  DPI/RST  — RST на SNI-рукопожатии"; C="Red"}
         @{T="  EXPIRED  — сертификат просрочен"; C="DarkGray"}
         @{T="  !CHAIN   — цепочка доверия сломана"; C="DarkGray"}
@@ -1160,7 +1201,8 @@ $global:LegendData = @{
         @{T="  TRUSTED       — chain verified OK"; C="White"}
         @{T="  TRUSTED(CDN)  — CDN cert, other TLD"; C="DarkCyan"}
         @{T="  TRUSTED(File) — Certs\ arbitration"; C="Cyan"}
-        @{T="  MITM     — CN mismatch (intercept?)"; C="Red"}
+        @{T="  TRUSTED* — valid cert, other name"; C="DarkCyan"}
+        @{T="  MITM     — untrusted cert, wrong host"; C="Red"}
         @{T="  DPI/RST  — reset at SNI handshake"; C="Red"}
         @{T="  EXPIRED  — certificate expired"; C="DarkGray"}
         @{T="  !CHAIN   — trust chain broken"; C="DarkGray"}
@@ -1214,7 +1256,7 @@ function Show-IPInfo {
     # Ширина строк <= 36 символов (LeftW=36) — не обрезается
     $menuLines = if ($isRU) { @(
         [pscustomobject]@{T="====================================";C="Cyan"}
-        [pscustomobject]@{T="  NetworkChecker v1.14$debug";C="Yellow"}
+        [pscustomobject]@{T="  NetworkChecker $script:VersionTag$debug";C="Yellow"}
         [pscustomobject]@{T="  Anton Sidorenko & AI Team";C="DarkGray"}
         [pscustomobject]@{T="====================================";C="Cyan"}
         [pscustomobject]@{T="  Local IP   : $local";C="White"}
@@ -1223,6 +1265,7 @@ function Show-IPInfo {
         [pscustomobject]@{T="====================================";C="Cyan"}
         [pscustomobject]@{T="  1 - Сетевой монитор";C="White"}
         [pscustomobject]@{T="  2 - Проверка доменов (lists\)";C="White"}
+        [pscustomobject]@{T="  3 - Планировщик задач";C="White"}
         [pscustomobject]@{T="  6 - Одиночная проверка";C="White"}
         [pscustomobject]@{T="  7 - Руководство";C="White"}
         [pscustomobject]@{T="  9 - Сертификаты$certs";C="White"}
@@ -1231,7 +1274,7 @@ function Show-IPInfo {
         [pscustomobject]@{T=$hint;C="DarkGray"}
     ) } else { @(
         [pscustomobject]@{T="====================================";C="Cyan"}
-        [pscustomobject]@{T="  NetworkChecker v1.14$debug";C="Yellow"}
+        [pscustomobject]@{T="  NetworkChecker $script:VersionTag$debug";C="Yellow"}
         [pscustomobject]@{T="  Anton Sidorenko & AI Team";C="DarkGray"}
         [pscustomobject]@{T="====================================";C="Cyan"}
         [pscustomobject]@{T="  Local IP   : $local";C="White"}
@@ -1240,6 +1283,7 @@ function Show-IPInfo {
         [pscustomobject]@{T="====================================";C="Cyan"}
         [pscustomobject]@{T="  1 - Network Monitor";C="White"}
         [pscustomobject]@{T="  2 - Domain scan (lists\)";C="White"}
+        [pscustomobject]@{T="  3 - Task Scheduler";C="White"}
         [pscustomobject]@{T="  6 - Single check";C="White"}
         [pscustomobject]@{T="  7 - Manual";C="White"}
         [pscustomobject]@{T="  9 - Certificates$certs";C="White"}
@@ -1462,8 +1506,8 @@ function Check-Single {
     $inputStr = Read-Host "  $(T 'Domains')"
     if (-not $inputStr) { return }
 
-    Write-Host "Количество пингов для медианы [по умолчанию 10]:"
-    $countRaw = Read-Host "Количество (Enter = 10)"
+    Write-Host "  $(T 'PingPrompt')"
+    $countRaw = Read-Host "  $(T 'PingInput')"
 
     if ($countRaw -match '^\d+$' -and [int]$countRaw -gt 0) {
         $pingCount = [int]$countRaw
@@ -1479,7 +1523,7 @@ function Check-Single {
     # Шапка отчёта (Google AI: для отправки в саппорт)
     $reportTime = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
     $logLines.Add("=====================================")
-    $logLines.Add("NetworkChecker v1.14 | SINGLE CHECK REPORT")
+    $logLines.Add("NetworkChecker $script:VersionTag | SINGLE CHECK REPORT")
     $logLines.Add("Time: $reportTime")
     $logLines.Add("External IP: $global:CachedExternalIP")
     $logLines.Add("Geo        : $global:CachedGeo")
@@ -1500,27 +1544,27 @@ function Check-Single {
         $logLines.Add("DNS    : $dns  IP: $ip")
 
         if (-not $ip) {
-            Write-Host "Статус : DOWN (DNS не прошёл)" -ForegroundColor Red
-            $logLines.Add("Статус : DOWN (DNS не прошёл)")
+            Write-Host "$(T 'StatusLbl') : $(T 'DownDNS')" -ForegroundColor Red
+            $logLines.Add("$(T 'StatusLbl') : $(T 'DownDNS')")
             $logLines.Add("")
             continue
         }
 
-        Write-Host "Пингую $pingCount раз..." -NoNewline
+        Write-Host "$(T 'Pinging') $pingCount $(T 'PingTimes')" -NoNewline
         $p = Get-PingStats $ip -Count $pingCount
-        Write-Host " готово"
+        Write-Host "$(T 'PingDone')"
         # v1.7: визуальный блок пинга — медиана выделена как основной показатель
-        $pingLine = "Ping   : avg={0}ms  median={1}ms  min={2}ms  max={3}ms  loss={4}%" -f `
-            $p.Avg, $p.Median, $p.Min, $p.Max, $p.Loss
+        $pingLine = "Ping   : avg={0}  median={1}  min={2}  max={3}  loss={4}%" -f `
+            (Format-Ms $p.Avg), (Format-Ms $p.Median), (Format-Ms $p.Min), (Format-Ms $p.Max), $p.Loss
         Write-Host "Ping   : " -NoNewline
-        Write-Host "avg=$($p.Avg)ms" -NoNewline -ForegroundColor DarkGray
+        Write-Host "avg=$(Format-Ms $p.Avg)" -NoNewline -ForegroundColor DarkGray
         Write-Host "  " -NoNewline
         # Медиана — главный показатель (устойчив к выбросам)
         # FIX: try/catch — Median может быть строкой "timeout" когда ICMP заблокирован
         $medColor = "DarkGray"
         try { $medColor = if ([double]$p.Median -lt 50) { "Green" } elseif ([double]$p.Median -lt 150) { "Yellow" } else { "Red" } } catch {}
-        Write-Host "median=$($p.Median)ms" -NoNewline -ForegroundColor $medColor
-        Write-Host "  min=$($p.Min)ms  max=$($p.Max)ms  loss=$($p.Loss)%" -NoNewline -ForegroundColor DarkGray
+        Write-Host "median=$(Format-Ms $p.Median)" -NoNewline -ForegroundColor $medColor
+        Write-Host "  min=$(Format-Ms $p.Min)  max=$(Format-Ms $p.Max)  loss=$($p.Loss)%" -NoNewline -ForegroundColor DarkGray
         # Если avg и median расходятся > 10ms — был выброс, медиана точнее
         $showDrift = $false
         try { $showDrift = [Math]::Abs([double]$p.Avg - [double]$p.Median) -gt 10 } catch {}
@@ -1537,17 +1581,17 @@ function Check-Single {
                          elseif ($cert.DaysLeft -lt 30) { "Yellow" }
                          else                           { "Green" }
 
-            $certLine = "CERT   : {0}  ({1} дней)  Trust:{2}" -f $cert.Expiry, $cert.DaysLeft, $cert.Trust
+            $certLine = "CERT   : {0}  ({1} {3})  Trust:{2}" -f $cert.Expiry, $cert.DaysLeft, $cert.Trust, (T 'Days')
             Write-Host $certLine -ForegroundColor $certColor
             Write-Host ("         {0}" -f $cert.Subject)
             $logLines.Add($certLine)
             $logLines.Add("         $($cert.Subject)")
 
             if ($cert.Trust -eq "MITM") {
-                Write-Host "  ⚠ MITM: Сертификат не совпадает с доменом!" -ForegroundColor Red
-                Write-Host "    Возможно: подмена провайдером или антивирус перехватывает трафик" -ForegroundColor Yellow
-                $logLines.Add("  ⚠ MITM: Сертификат не совпадает с доменом!")
-                $logLines.Add("    Возможно: подмена провайдером или антивирус перехватывает трафик")
+                Write-Host (T 'MitmWarn1') -ForegroundColor Red
+                Write-Host (T 'MitmWarn2') -ForegroundColor Yellow
+                $logLines.Add((T 'MitmWarn1'))
+                $logLines.Add((T 'MitmWarn2'))
             }
         }
         else {
@@ -1603,8 +1647,8 @@ function Check-Single {
             "DOWN"     { "Red" }
             default    { "White" }
         }
-        Write-Host "Статус : $status" -ForegroundColor $color
-        $logLines.Add("Статус : $status")
+        Write-Host "$(T 'StatusLbl') : $status" -ForegroundColor $color
+        $logLines.Add("$(T 'StatusLbl') : $status")
         $logLines.Add("")   # пустая строка между доменами
     }
 
@@ -1644,7 +1688,7 @@ function Save-Log {
     $filePath = Join-Path $logsDir $fileName
 
     $header = @"
-NetworkChecker v1.14 — Лог проверки
+NetworkChecker $script:VersionTag — Лог проверки
 =====================================
 Дата       : $date
 Время      : $(Get-Date -Format "HH:mm:ss")
@@ -1657,13 +1701,13 @@ $Content
 "@
 
     $header | Out-File -FilePath $filePath -Encoding UTF8
-    Write-Host "  Лог сохранён: Logs\$fileName" -ForegroundColor DarkGray
+    Write-Host "$(T 'LogSaved')$fileName" -ForegroundColor DarkGray
 }
 
 
 # Вспомогательная функция — собирает вывод Check-List в строку для лога
 function Check-List-WithLog {
-    param($file, $type)
+    param($file, $type, [switch]$AutoSave)
 
     if (-not (Test-Path $file)) {
         Write-Host "Файл $file не найден" -ForegroundColor Red
@@ -1712,7 +1756,9 @@ function Check-List-WithLog {
         if ($r.Cert -like "*TRUSTED (File)*") { $color = "Cyan" }
         if ($r.Cert -like "*TRUSTED (CDN)*")  { $color = "DarkCyan" }
 
-        $line = ("{0,-25} {1,-10} DNS:{2,-4} TLS:{3,-4} HTTP:{4,-6} PING:{5,-10} LOSS:{6,-6} CERT:{7,-20} IP:{8}" -f `
+        # HTTP-поле -13: вмещает самые длинные значения FAIL(timeout)/FAIL(TLS-err),
+        # иначе они распирали строку и колонка IP «уезжала» вправо.
+        $line = ("{0,-25} {1,-10} DNS:{2,-4} TLS:{3,-4} HTTP:{4,-13} PING:{5,-10} LOSS:{6,-6} CERT:{7,-20} IP:{8}" -f `
             $r.Domain, $r.Status, $r.DNS, $r.TLS, $r.HTTP, $r.Ping, $r.Loss, $r.Cert, $r.IP)
 
         Write-Host "`r" -NoNewline  # очищаем строку прогресса
@@ -1733,6 +1779,13 @@ function Check-List-WithLog {
     Write-Host ("  $(T 'Summary'): {0}  UP={1}  DEGRADED={2}  DOWN={3}  Avg Ping={4}ms" -f `
         @($domains).Count, $cntUp, $cntDeg, $cntDown, $avgPing) -ForegroundColor Cyan
 
+    # AutoSave — для авто-режима (-RunList / Планировщик): сохраняем без запроса.
+    if ($AutoSave) {
+        Save-Log -Type $type -Content ($logLines -join "`n") `
+            -ExternalIP $global:CachedExternalIP -Geo $global:CachedGeo
+        return
+    }
+
     Write-Host ""
     Write-Host "  $(T 'SaveHint')" -ForegroundColor DarkGray
     $key = Read-Host " "
@@ -1740,6 +1793,127 @@ function Check-List-WithLog {
         Save-Log -Type $type -Content ($logLines -join "`n") `
             -ExternalIP $global:CachedExternalIP -Geo $global:CachedGeo
     }
+}
+
+
+# ============================================================
+# АВТО-РЕЖИМ + ПЛАНИРОВЩИК ЗАДАЧ (v1.14.4)
+# Неинтерактивный прогон списков для Планировщика Windows (schtasks).
+# Никаких служб и стороннего ПО — только штатный планировщик.
+# ============================================================
+function Get-NCTaskName { "NetworkChecker_AutoScan" }
+
+function Invoke-AutoRun {
+    # Прогон без меню: $ListName — имя файла из lists\ (с .txt или без) либо 'all'.
+    # Лог каждого списка сохраняется в Logs\ автоматически (AutoSave).
+    param([string]$ListName)
+
+    $listsDir = Join-Path $PSScriptRoot "lists"
+    if (-not (Test-Path $listsDir)) {
+        Write-Host "  lists\ не найдена" -ForegroundColor Red
+        return
+    }
+    $files = @(Get-ChildItem $listsDir -Filter "*.txt" -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -ne "active_certs.txt" })
+
+    if ($ListName -and $ListName -ne 'all') {
+        $want = $ListName
+        if ($want -notlike '*.txt') { $want += '.txt' }
+        $files = @($files | Where-Object { $_.Name -ieq $want })
+    }
+    if (-not $files -or $files.Count -eq 0) {
+        Write-Host "  Список '$ListName' не найден в lists\" -ForegroundColor Red
+        return
+    }
+
+    if (-not $Quiet) {
+        Write-Host "  Авто-проверка ($($files.Count) сп.) — $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor Cyan
+    }
+    foreach ($f in $files) {
+        $typeName = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+        $typeName = $typeName.Substring(0,1).ToUpper() + $typeName.Substring(1)
+        Check-List-WithLog $f.FullName $typeName -AutoSave
+    }
+    if (-not $Quiet) {
+        Write-Host "  Готово. Логи: Logs\" -ForegroundColor DarkGray
+    }
+}
+
+function Manage-Schedule {
+    # UI управления задачей Планировщика. Создаёт/удаляет ежедневный авто-скан.
+    $ru = ($global:Lang -ne "EN")
+    $taskName = Get-NCTaskName
+
+    while ($true) {
+        Clear-Host
+        Write-Host ("  === " + $(if ($ru){"Планировщик задач"}else{"Task Scheduler"}) + " ===") -ForegroundColor Cyan
+        Write-Host ""
+
+        # Текущее состояние задачи
+        schtasks /Query /TN $taskName *>$null
+        $exists = ($LASTEXITCODE -eq 0)
+        if ($exists) {
+            Write-Host ("  " + $(if($ru){"Задача создана"}else{"Task installed"}) + ": $taskName") -ForegroundColor Green
+            schtasks /Query /TN $taskName /FO LIST 2>$null |
+                Where-Object { $_ -match '^(Next Run Time|Schedule|Task To Run|Время следующего|Расписание|Запускаемая)' } |
+                ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        } else {
+            Write-Host ("  " + $(if($ru){"Задача не создана"}else{"No task installed"})) -ForegroundColor DarkGray
+        }
+
+        Write-Host ""
+        Write-Host ("  1 - " + $(if($ru){"Создать/пересоздать ежедневный авто-скан"}else{"Create/replace daily auto-scan"})) -ForegroundColor White
+        Write-Host ("  2 - " + $(if($ru){"Удалить задачу"}else{"Delete task"})) -ForegroundColor White
+        Write-Host ("  0 - " + $(if($ru){"Назад"}else{"Back"})) -ForegroundColor DarkGray
+        Write-Host ""
+        $sel = Read-Host "  $(T 'Choice')"
+
+        switch ($sel) {
+            "1" { Install-ScheduledTask }
+            "2" {
+                if ($exists) {
+                    schtasks /Delete /TN $taskName /F *>$null
+                    Write-Host ("  " + $(if($ru){"Задача удалена"}else{"Task deleted"})) -ForegroundColor Yellow
+                } else {
+                    Write-Host ("  " + $(if($ru){"Нечего удалять"}else{"Nothing to delete"})) -ForegroundColor DarkGray
+                }
+                Start-Sleep 1
+            }
+            "0"     { return }
+            default { }
+        }
+    }
+}
+
+function Install-ScheduledTask {
+    $ru = ($global:Lang -ne "EN")
+    $taskName = Get-NCTaskName
+
+    # Какой список гонять
+    Write-Host ""
+    Write-Host ("  " + $(if($ru){"Какой список проверять? (имя файла из lists\ без .txt, или 'all')"}else{"Which list? (file name from lists\ without .txt, or 'all')"})) -ForegroundColor DarkGray
+    $list = Read-Host "  lists\"
+    if (-not $list) { $list = "all" }
+
+    # Время запуска (HH:mm)
+    Write-Host ("  " + $(if($ru){"Время ежедневного запуска [ЧЧ:ММ, Enter = 09:00]"}else{"Daily run time [HH:mm, Enter = 09:00]"})) -ForegroundColor DarkGray
+    $time = Read-Host "  HH:mm"
+    if ($time -notmatch '^\d{1,2}:\d{2}$') { $time = "09:00" }
+
+    # Команда запуска: текущий powershell + этот скрипт + авто-режим
+    $psExe = (Get-Command powershell.exe).Source
+    $tr = "`"$psExe`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -RunList `"$list`" -Quiet"
+
+    # /RL HIGHEST — задача стартует с правами администратора (скрипту они нужны).
+    # /F — перезаписать, если задача уже есть.
+    schtasks /Create /TN $taskName /TR $tr /SC DAILY /ST $time /RL HIGHEST /F *>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host ("  " + $(if($ru){"Задача создана"}else{"Task created"}) + ": $list @ $time") -ForegroundColor Green
+        Write-Host ("  " + $(if($ru){"Логи будут в Logs\ после каждого запуска"}else{"Logs will appear in Logs\ after each run"})) -ForegroundColor DarkGray
+    } else {
+        Write-Host ("  " + $(if($ru){"Не удалось создать задачу (код $LASTEXITCODE)"}else{"Failed to create task (code $LASTEXITCODE)"})) -ForegroundColor Red
+    }
+    Start-Sleep 2
 }
 
 
@@ -1786,10 +1960,13 @@ function Show-Manual {
 
     if ($global:Lang -ne "EN") {
 
-        Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-        Write-Host "║   NetworkChecker v1.14 — Руководство пользователя                ║" -ForegroundColor Cyan
-        Write-Host "║   Developed by Anton Sidorenko & AI Team                         ║" -ForegroundColor DarkGray
-        Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        # Рамка собирается программно (Inner=66) — выравнивание не зависит от
+        # длины строки версии (раньше было «прибито» пробелами и ломалось при правке).
+        $mW = 66
+        Write-Host ("╔" + ([string][char]0x2550 * $mW) + "╗") -ForegroundColor Cyan
+        Write-Host ("║" + ("   NetworkChecker $script:VersionTag — Руководство пользователя").PadRight($mW).Substring(0,$mW) + "║") -ForegroundColor Cyan
+        Write-Host ("║" + "   Developed by Anton Sidorenko & AI Team".PadRight($mW).Substring(0,$mW) + "║") -ForegroundColor DarkGray
+        Write-Host ("╚" + ([string][char]0x2550 * $mW) + "╝") -ForegroundColor Cyan
         Write-Host ""
 
         # ─────────────────────────────────────────────────────
@@ -1813,7 +1990,7 @@ function Show-Manual {
         Write-Host "  Создай рядом со скриптом следующие папки:"
         Write-Host ""
         Write-Host "  NC\"
-        Write-Host "   ├── NetworkChecker_v1_14.ps1  ← сам скрипт" -ForegroundColor White
+        Write-Host "   ├── NetworkChecker.ps1        ← сам скрипт" -ForegroundColor White
         Write-Host "   ├── lists\                    ← папка со списками доменов" -ForegroundColor Cyan
         Write-Host "   │    ├── russia.txt            один домен на строку, без https://" -ForegroundColor DarkGray
         Write-Host "   │    ├── foreign.txt           строки с # — комментарии, игнорируются" -ForegroundColor DarkGray
@@ -1838,7 +2015,7 @@ function Show-Manual {
         Write-Host "  Скрипт требует прав администратора."
         Write-Host "  • ПКМ на файле → 'Запустить от имени администратора'"
         Write-Host "  • Или: скрипт запросит UAC автоматически при старте"
-        Write-Host "  • Или в консоли: powershell -ExecutionPolicy Bypass -File NetworkChecker_v1_14.ps1"
+        Write-Host "  • Или в консоли: powershell -ExecutionPolicy Bypass -File NetworkChecker.ps1"
         Write-Host ""
 
         # ─────────────────────────────────────────────────────
@@ -1860,8 +2037,17 @@ function Show-Manual {
         Write-Host "  2 — Проверка списков доменов" -ForegroundColor White
         Write-Host "      Показывает все .txt файлы из папки lists\."
         Write-Host "      Введи номер(а) через запятую или 'all' для проверки всех."
+        Write-Host "      Несколько списков (или 'all') → ОДНА сводная таблица с общим"
+        Write-Host "      итогом; повторяющиеся домены проверяются один раз (дедуп)."
+        Write-Host "      Один список → подробный разбор именно этого файла."
         Write-Host "      Прогресс отображается полосой: [████████░░░░] 60%"
         Write-Host "      После завершения: нажми S для сохранения лога в Logs\"
+        Write-Host ""
+        Write-Host "  3 — Планировщик задач (авто-проверка)" -ForegroundColor White
+        Write-Host "      Создаёт задачу Windows (schtasks), которая раз в день сама"
+        Write-Host "      проверяет выбранный список и пишет отчёт в Logs\ — без участия"
+        Write-Host "      пользователя. Никаких служб и стороннего ПО, только штатный"
+        Write-Host "      Планировщик. Вручную: -RunList <имя|all> -Quiet"
         Write-Host ""
         Write-Host "  6 — Одиночная проверка" -ForegroundColor White
         Write-Host "      Подробная диагностика одного или нескольких доменов."
@@ -1914,10 +2100,12 @@ function Show-Manual {
         Write-Host "   TRUSTED        — сертификат действителен, цепочка проверена"
         Write-Host "   TRUSTED(CDN)   — сертификат от CDN (другой домен, тот же владелец)" -ForegroundColor DarkCyan
         Write-Host "   TRUSTED(File)  — подтверждён через файл в Certs\ (Smart Arbitration)" -ForegroundColor Cyan
+        Write-Host "   TRUSTED*       — валидный серт, но имя не совпало (CDN или редирект" -ForegroundColor DarkCyan
+        Write-Host "                    на стаб — смотри IP и HTTP)" -ForegroundColor DarkCyan
         Write-Host "   EXPIRED        — сертификат просрочен"
         Write-Host "   SELF-SIGN      — самоподписанный, не из публичного CA"
         Write-Host "   !CHAIN         — цепочка доверия прервана"
-        Write-Host "   MITM           — домен и сертификат не совпадают (возможен перехват)" -ForegroundColor Red
+        Write-Host "   MITM           — недоверенный серт на чужое имя (реальный перехват)" -ForegroundColor Red
         Write-Host "   DPI/RST        — соединение сброшено при попытке установить TLS" -ForegroundColor Red
         Write-Host ""
         Write-Host "  Итоговый статус строки:" -ForegroundColor White
@@ -2004,14 +2192,19 @@ function Show-Manual {
         Write-Host "            удалён дубль Show-Legend и мёртвый Show-SideHelp" -ForegroundColor DarkGray
         Write-Host "  v1.14.3   Монитор: анти-мерцание, сортировка/фильтр/пауза;" -ForegroundColor DarkGray
         Write-Host "            кнопка L переключает легенду (вкл/выкл)" -ForegroundColor DarkGray
+        Write-Host "  v1.14.4   Константа версии, локализация EN, авто-режим (-RunList)," -ForegroundColor DarkGray
+        Write-Host "            интеграция с Планировщиком задач, фикс -DebugMode" -ForegroundColor DarkGray
+        Write-Host "  v1.14.5   Точный вердикт серта: MITM только при недовер. цепочке +" -ForegroundColor DarkGray
+        Write-Host "            чужом имени; убраны ложные MITM на CDN; сводная таблица all" -ForegroundColor DarkGray
         Write-Host ""
 
     } else {
         # ── ENGLISH VERSION ──────────────────────────────────────────────────
-        Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-        Write-Host "║   NetworkChecker v1.14 — User Manual                             ║" -ForegroundColor Cyan
-        Write-Host "║   Developed by Anton Sidorenko & AI Team                         ║" -ForegroundColor DarkGray
-        Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        $mW = 66
+        Write-Host ("╔" + ([string][char]0x2550 * $mW) + "╗") -ForegroundColor Cyan
+        Write-Host ("║" + ("   NetworkChecker $script:VersionTag — User Manual").PadRight($mW).Substring(0,$mW) + "║") -ForegroundColor Cyan
+        Write-Host ("║" + "   Developed by Anton Sidorenko & AI Team".PadRight($mW).Substring(0,$mW) + "║") -ForegroundColor DarkGray
+        Write-Host ("╚" + ([string][char]0x2550 * $mW) + "╝") -ForegroundColor Cyan
         Write-Host ""
         Write-Host "  ▌ WHAT IS THIS" -ForegroundColor Yellow
         Write-Host "  ─────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
@@ -2030,7 +2223,8 @@ function Show-Manual {
         Write-Host "  ▌ MENU" -ForegroundColor Yellow
         Write-Host "  ─────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
         Write-Host "  1 — Live network monitor (Q-quit S-sort F-filter P-pause)"
-        Write-Host "  2 — Scan domain lists from lists\ folder"
+        Write-Host "  2 — Scan domain lists ('all'/multi = one combined table, dedup)"
+        Write-Host "  3 — Task Scheduler: daily auto-scan (schtasks, no service)"
         Write-Host "  6 — Single deep check: google.com,vk.com"
         Write-Host "  7 — This manual"
         Write-Host "  9 — Certificate manager (Smart Arbitration)"
@@ -2044,7 +2238,8 @@ function Show-Manual {
         Write-Host "   TRUSTED       — certificate chain verified"
         Write-Host "   TRUSTED(CDN)  — CDN cert, different TLD same owner" -ForegroundColor DarkCyan
         Write-Host "   TRUSTED(File) — verified via Certs\ arbitration" -ForegroundColor Cyan
-        Write-Host "   MITM          — CN mismatch, possible intercept" -ForegroundColor Red
+        Write-Host "   TRUSTED*      — valid cert but name mismatch (CDN or redirect)" -ForegroundColor DarkCyan
+        Write-Host "   MITM          — untrusted cert for wrong host (real intercept)" -ForegroundColor Red
         Write-Host "   DPI/RST       — connection reset at TLS stage" -ForegroundColor Red
         Write-Host "   EXPIRED / !CHAIN / SELF-SIGN — cert issues"
         Write-Host ""
@@ -2080,6 +2275,79 @@ function Show-Manual {
 # Читает все .txt из папки lists\, нет жёсткой привязки к именам
 # Управление идентично Select-CertFile: номера, all, 0=назад
 # ============================================================
+function Check-CombinedLists {
+    # Сводная проверка нескольких списков ОДНОЙ таблицей. Домены объединяются и
+    # дедуплицируются между файлами (регистр игнорируется), проверяются один раз,
+    # выводятся единым списком + один общий итог. Используется при выборе 'all'
+    # или нескольких номеров в пункте 2.
+    param([array]$Files)
+    $ru = ($global:Lang -ne "EN")
+
+    # Уникальные домены, порядок сохраняем, повтор между списками отбрасываем
+    $seen    = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $domains = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $Files) {
+        try {
+            Get-Content $f.FullName -Encoding UTF8 |
+                ForEach-Object { $_ -replace "`r", '' } |
+                Where-Object { $_ -and -not $_.TrimStart().StartsWith("#") } |
+                ForEach-Object { Sanitize-Domain $_ } |
+                Where-Object { $_ } |
+                ForEach-Object { if ($seen.Add($_)) { [void]$domains.Add($_) } }
+        } catch {}
+    }
+    if ($domains.Count -eq 0) {
+        Write-Host ("  " + $(if($ru){"Нет доменов для проверки"}else{"No domains to check"})) -ForegroundColor Yellow
+        return
+    }
+
+    $listNames = ($Files | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }) -join ", "
+    Write-Host ""
+    Write-Host ("  === " + $(if($ru){"Сводная проверка"}else{"Combined scan"}) + " ($($Files.Count)) ===") -ForegroundColor Cyan
+    Write-Host ("  $listNames") -ForegroundColor DarkGray
+    Write-Host ("  $(T 'DomainsCount'): $($domains.Count)") -ForegroundColor DarkGray
+
+    $logLines = [System.Collections.Generic.List[string]]::new()
+    $total = $domains.Count
+    $idx = 0
+    foreach ($d in $domains) {
+        $idx++
+        $pct  = [int]($idx / $total * 20)
+        $bar  = ('█' * $pct) + ('░' * (20 - $pct))
+        $pctN = [int]($idx / $total * 100)
+        Write-Host ("`r  [$bar] $pctN%  {0,-40}" -f $d) -NoNewline -ForegroundColor DarkGray
+        $r = Test-Domain $d
+
+        $color = switch ($r.Status) { "UP" {"Green"} "DEGRADED" {"Yellow"} "DOWN" {"Red"} default {"White"} }
+        if ($r.Cert -like "*TRUSTED (File)*") { $color = "Cyan" }
+        if ($r.Cert -like "*TRUSTED (CDN)*")  { $color = "DarkCyan" }
+
+        $line = ("{0,-25} {1,-10} DNS:{2,-4} TLS:{3,-4} HTTP:{4,-13} PING:{5,-10} LOSS:{6,-6} CERT:{7,-20} IP:{8}" -f `
+            $r.Domain, $r.Status, $r.DNS, $r.TLS, $r.HTTP, $r.Ping, $r.Loss, $r.Cert, $r.IP)
+        Write-Host "`r" -NoNewline
+        Write-Host $line -ForegroundColor $color
+        $logLines.Add($line)
+    }
+
+    $results = @($logLines)
+    $cntUp   = ($results | Where-Object { $_ -match ' UP ' }).Count
+    $cntDeg  = ($results | Where-Object { $_ -match ' DEGRADED ' }).Count
+    $cntDown = ($results | Where-Object { $_ -match ' DOWN ' }).Count
+    $pings   = $results | ForEach-Object { if ($_ -match 'PING:(\d+)') { [int]$Matches[1] } } | Where-Object { $_ }
+    $avgPing = if ($pings) { [int](($pings | Measure-Object -Average).Average) } else { 0 }
+    Write-Host ""
+    Write-Host ("  $(T 'Summary'): {0}  UP={1}  DEGRADED={2}  DOWN={3}  Avg Ping={4}ms" -f `
+        $results.Count, $cntUp, $cntDeg, $cntDown, $avgPing) -ForegroundColor Cyan
+
+    Write-Host ""
+    Write-Host "  $(T 'SaveHint')" -ForegroundColor DarkGray
+    $key = Read-Host " "
+    if ($key -eq "S" -or $key -eq "s" -or $key -eq "с" -or $key -eq "С") {
+        Save-Log -Type "Combined" -Content ($logLines -join "`n") `
+            -ExternalIP $global:CachedExternalIP -Geo $global:CachedGeo
+    }
+}
+
 function Invoke-MultiList {
     $listsDir = Join-Path $PSScriptRoot "lists"
     if (-not (Test-Path $listsDir)) {
@@ -2117,9 +2385,9 @@ function Invoke-MultiList {
     }
     Write-Host "  └───────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  Введите номер(а) через запятую или 'all' для всех:" -ForegroundColor DarkGray
-    Write-Host "  Пример: 1,3  или  all  или  0 для отмены" -ForegroundColor DarkGray
-    $sel = Read-Host "  Выбор"
+    Write-Host "  $(T 'ListPrompt')" -ForegroundColor DarkGray
+    Write-Host "  $(T 'ListHint')" -ForegroundColor DarkGray
+    $sel = Read-Host "  $(T 'Cancel')"
 
     if (-not $sel -or $sel -eq "0") { return }
 
@@ -2138,11 +2406,18 @@ function Invoke-MultiList {
         return
     }
 
-    foreach ($f in $selected) {
-        $typeName = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-        # Капитализируем первую букву для красивого лога
-        $typeName = $typeName.Substring(0,1).ToUpper() + $typeName.Substring(1)
-        Check-List-WithLog $f.FullName $typeName
+    $selected = @($selected)
+    # Несколько списков (вкл. 'all') → одна сводная таблица с дедупом.
+    # Один список → подробная проверка этого файла, как раньше.
+    if ($selected.Count -gt 1) {
+        Check-CombinedLists $selected
+    } else {
+        foreach ($f in $selected) {
+            $typeName = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            # Капитализируем первую букву для красивого лога
+            $typeName = $typeName.Substring(0,1).ToUpper() + $typeName.Substring(1)
+            Check-List-WithLog $f.FullName $typeName
+        }
     }
 }
 
@@ -2270,6 +2545,16 @@ function Select-CertFile {
 # Загружаем активные сертификаты при первом запуске
 Load-ActiveCerts
 
+# ── Авто-режим (Планировщик задач) ───────────────────────────────────
+# Если передан -RunList <имя|all> — гоним проверку без меню, сохраняем
+# логи в Logs\ и выходим. Сюда же попадает запуск из schtasks.
+if ($RunList) {
+    $global:CachedExternalIP = Get-ExternalIP
+    $global:CachedGeo        = Get-Geo $global:CachedExternalIP
+    Invoke-AutoRun -ListName $RunList
+    exit
+}
+
 # ── Первичная инициализация — один раз, до цикла ─────────────────────
 Write-Host "  Получаем сетевые данные..." -ForegroundColor DarkGray
 $global:CachedExternalIP = Get-ExternalIP
@@ -2289,6 +2574,7 @@ do {
     switch ($c.ToUpper()) {
         "1"  { Show-NetMonitor }
         "2"  { Invoke-MultiList }
+        "3"  { Manage-Schedule }
         "6"  { Check-Single }
         "7"  { Show-Manual }
         # 8 — переключение языка RU⇄EN (без перезапуска, мгновенно)
