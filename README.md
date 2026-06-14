@@ -62,15 +62,19 @@ DNS → TCP → TLS → CERT → HTTP
 
 ## 📌 Пример результата
 
+Первая колонка — **вывод простым языком**, дальше техсырьё:
+
 ```
-sberbank.ru   DEGRADED  DNS:OK  TLS:OK  HTTP:FAIL(RST)  CERT:MITM
+google.com     Доступен       DNS:OK  TLS:OK  HTTP:200       CERT:TRUSTED   IP:142.251.143.142
+facebook.com   Заглушка       DNS:OK  TLS:OK  HTTP:FAIL(503) CERT:TRUSTED*  IP:188.186.146.208
+whatsapp.com   Блок TLS       DNS:OK  TLS:FAIL HTTP:FAIL     CERT:FAIL      IP:157.240.205.60
+gstatic.com    Без страницы   DNS:OK  TLS:OK  HTTP:FAIL(404) CERT:TRUSTED   IP:172.217.19.227
+
+Итог: 4   Доступно:1  Без стр.:1  Блок:2  Нет DNS:0
 ```
 
-Это значит:
-
-* DNS работает
-* TLS установлен
-* но соединение сброшено → вероятен DPI
+Читается с первого взгляда: `Доступен` — работает, `Блок …`/`Заглушка` —
+заблокирован, `Без страницы` — жив, просто нет веб-страницы (не блокировка).
 
 ---
 
