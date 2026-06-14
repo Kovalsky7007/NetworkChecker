@@ -92,7 +92,7 @@ param(
 # Используется в меню, шапках отчётов, логах и Руководстве.
 # (В комментариях-истории версии оставлены как есть — это хронология.)
 # ============================================================
-$script:Version    = "1.14.9"
+$script:Version    = "1.15.0"
 $script:VersionTag = "v$script:Version"
 
 # Если передан флаг -DebugMode при запуске — активируем Verbose-вывод сразу.
@@ -1401,6 +1401,7 @@ function Show-IPInfo {
         [pscustomobject]@{T="  2 - Проверка доменов (lists\)";C="White"}
         [pscustomobject]@{T="  3 - Планировщик задач";C="White"}
         [pscustomobject]@{T="  4 - DNS-проверка (подмена)";C="White"}
+        [pscustomobject]@{T="  5 - SSH-проверка (доступ к VPS)";C="White"}
         [pscustomobject]@{T="  6 - Одиночная проверка";C="White"}
         [pscustomobject]@{T="  7 - Руководство";C="White"}
         [pscustomobject]@{T="  9 - Сертификаты$certs";C="White"}
@@ -1421,6 +1422,7 @@ function Show-IPInfo {
         [pscustomobject]@{T="  2 - Domain scan (lists\)";C="White"}
         [pscustomobject]@{T="  3 - Task Scheduler";C="White"}
         [pscustomobject]@{T="  4 - DNS check (spoof)";C="White"}
+        [pscustomobject]@{T="  5 - SSH check (VPS access)";C="White"}
         [pscustomobject]@{T="  6 - Single check";C="White"}
         [pscustomobject]@{T="  7 - Manual";C="White"}
         [pscustomobject]@{T="  9 - Certificates$certs";C="White"}
@@ -1946,6 +1948,98 @@ function Show-DnsCheck {
 }
 
 
+# ============================================================
+# SSH-ПРОВЕРКА (v1.15.0) — пункт 5
+# Проверяет ДОСТУПНОСТЬ SSH-порта и читает приветственный баннер sshd
+# ("SSH-2.0-OpenSSH_..."). Помогает диагностировать «не могу зайти на VPS»:
+# порт закрыт/фильтруется vs sshd отвечает vs коннект есть, но баннера нет
+# (типичный признак fail2ban / бана IP). ТОЛЬКО доступность — без входа, паролей
+# и перебора. Никаких попыток аутентификации.
+# ============================================================
+function Test-SshPort {
+    param([string]$HostName, [int]$Port = 22, [int]$TimeoutMs = 4000)
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    $sw  = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $ar = $tcp.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            try { $tcp.Close() } catch {}
+            return @{ State='timeout'; Banner=$null; Ms=[int]$sw.ElapsedMilliseconds }
+        }
+        try { $tcp.EndConnect($ar) }
+        catch { return @{ State='refused'; Banner=$null; Ms=[int]$sw.ElapsedMilliseconds } }
+
+        # sshd сразу присылает строку-баннер. Читаем её (без отправки чего-либо).
+        $banner = $null
+        try {
+            $stream = $tcp.GetStream()
+            $stream.ReadTimeout = 2500
+            $buf = New-Object byte[] 256
+            $n = $stream.Read($buf, 0, $buf.Length)
+            if ($n -gt 0) { $banner = ([System.Text.Encoding]::ASCII.GetString($buf, 0, $n)).Trim() }
+        } catch {}
+        $sw.Stop()
+        if     ($banner -match '^SSH-') { return @{ State='ssh';        Banner=$banner; Ms=[int]$sw.ElapsedMilliseconds } }
+        elseif ($banner)               { return @{ State='open-other';  Banner=$banner; Ms=[int]$sw.ElapsedMilliseconds } }
+        else                           { return @{ State='open-silent'; Banner=$null;   Ms=[int]$sw.ElapsedMilliseconds } }
+    }
+    catch { return @{ State='error'; Banner=$null; Ms=[int]$sw.ElapsedMilliseconds } }
+    finally { try { $tcp.Close() } catch {} }
+}
+
+function Show-SshCheck {
+    $ru = ($global:Lang -ne "EN")
+    Write-Host ("  === " + $(if($ru){"SSH-проверка (доступность порта + баннер)"}else{"SSH check (port reachability + banner)"}) + " ===") -ForegroundColor Cyan
+    Write-Host ("  " + $(if($ru){"Только проверка доступа — без входа, паролей и перебора."}else{"Reachability only — no login, passwords or brute force."})) -ForegroundColor DarkGray
+    Write-Host ""
+    $inputStr = Read-Host "  $(if($ru){'Хост(ы) через запятую (можно host:port)'}else{'Host(s), comma-separated (host:port ok)'})"
+    if (-not $inputStr) { return }
+    Write-Host ("  " + $(if($ru){"Порт по умолчанию [Enter = 22]"}else{"Default port [Enter = 22]"})) -ForegroundColor DarkGray
+    $portRaw = Read-Host "  port"
+    $defPort = if ($portRaw -match '^\d+$') { [int]$portRaw } else { 22 }
+
+    $targets = $inputStr -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("SSH check $script:VersionTag  $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')"); $log.Add("")
+    Write-Host ""
+
+    foreach ($t in @($targets)) {
+        $port = $defPort; $h = $t
+        if ($t -match '^(.+):(\d+)$') { $h = $Matches[1]; $port = [int]$Matches[2] }
+        $clean = Sanitize-Domain $h
+        if ($clean) { $h = $clean } else { $h = ($t -split ':')[0] }   # IP проходит как есть
+
+        $ipInfo = Resolve-Domain $h
+        $ip = if ($ipInfo.OK) { $ipInfo.IP } else { $h }
+
+        $r = Test-SshPort -HostName $h -Port $port
+        switch ($r.State) {
+            'ssh'         { $vt = if($ru){"SSH доступен"}else{"SSH reachable"}; $vc="Green" }
+            'open-other'  { $vt = if($ru){"порт открыт, но это не SSH"}else{"port open, not SSH"}; $vc="Yellow" }
+            'open-silent' { $vt = if($ru){"порт открыт, баннера нет (возможно fail2ban / бан IP)"}else{"port open, no banner (fail2ban / IP ban?)"}; $vc="Yellow" }
+            'refused'     { $vt = if($ru){"соединение отклонено — порт закрыт (sshd не слушает?)"}else{"connection refused — port closed (sshd down?)"}; $vc="Red" }
+            'timeout'     { $vt = if($ru){"нет ответа — порт фильтруется (фаервол/Security Group)"}else{"no response — filtered (firewall/security group)"}; $vc="Red" }
+            default       { $vt = if($ru){"ошибка проверки"}else{"check error"}; $vc="DarkGray" }
+        }
+
+        Write-Host ("  {0}:{1}" -f $h, $port) -ForegroundColor Cyan
+        Write-Host  ("    IP      : $ip")
+        if ($r.Banner) { Write-Host ("    Баннер  : $($r.Banner)") -ForegroundColor DarkGray }
+        Write-Host  ("    -> $vt  ($($r.Ms) ms)") -ForegroundColor $vc
+        Write-Host ""
+        $log.Add("${h}:${port}  IP:$ip")
+        if ($r.Banner) { $log.Add("  banner: $($r.Banner)") }
+        $log.Add("  -> $vt ($($r.Ms) ms)"); $log.Add("")
+    }
+
+    Write-Host "  $(T 'SaveHint')" -ForegroundColor DarkGray
+    $key = Read-Host " "
+    if ($key -eq "S" -or $key -eq "s" -or $key -eq "с" -or $key -eq "С") {
+        Save-Log -Type "SSH" -Content ($log -join "`n") -ExternalIP $global:CachedExternalIP -Geo $global:CachedGeo
+    }
+}
+
+
 # ==============================
 # ЛОГИРОВАНИЕ
 # v1.3: сохранение результатов в Logs\ после любой проверки
@@ -2313,6 +2407,13 @@ function Show-Manual {
         Write-Host "      Показывает задержку: быстрый ответ «1.1.1.1» (2-6мс) = локальный перехват."
         Write-Host "      Отличает DNS-блок от DPI-блока в канале."
         Write-Host ""
+        Write-Host "  5 — SSH-проверка (доступ к VPS)" -ForegroundColor White
+        Write-Host "      Проверяет, отвечает ли SSH-порт, и читает баннер sshd. Помогает,"
+        Write-Host "      когда «не могу зайти на сервер»: порт закрыт / фильтруется фаерволом /"
+        Write-Host "      коннект есть, но баннера нет (часто fail2ban или бан вашего IP)."
+        Write-Host "      Ввод: 1.2.3.4 или myvps.ru:2222 (порт по умолчанию 22)."
+        Write-Host "      ТОЛЬКО проверка доступа — без логина, паролей и перебора."
+        Write-Host ""
         Write-Host "  3 — Планировщик задач (авто-проверка)" -ForegroundColor White
         Write-Host "      Создаёт задачу Windows (schtasks), которая раз в день сама"
         Write-Host "      проверяет выбранный список и пишет отчёт в Logs\ — без участия"
@@ -2486,6 +2587,8 @@ function Show-Manual {
         Write-Host "            задержка по каждому резолверу" -ForegroundColor DarkGray
         Write-Host "  v1.14.9   Фикс ложного перехвата: гео-разница CDN (google) теперь" -ForegroundColor DarkGray
         Write-Host "            «расходится», а не «ПЕРЕХВАТ»; красный — только заглушка" -ForegroundColor DarkGray
+        Write-Host "  v1.15.0   SSH-проверка (пункт 5): доступность порта + баннер sshd," -ForegroundColor DarkGray
+        Write-Host "            детект fail2ban/бана; только доступ, без логина" -ForegroundColor DarkGray
         Write-Host ""
 
     } else {
@@ -2516,6 +2619,7 @@ function Show-Manual {
         Write-Host "  2 — Scan domain lists ('all'/multi = one combined table, dedup)"
         Write-Host "  3 — Task Scheduler: daily auto-scan (schtasks, no service)"
         Write-Host "  4 — DNS check: plaintext vs DoH truth, custom servers, latency"
+        Write-Host "  5 — SSH check: port reachability + sshd banner (no login)"
         Write-Host "  6 — Single deep check: google.com,vk.com"
         Write-Host "  7 — This manual"
         Write-Host "  9 — Certificate manager (Smart Arbitration)"
@@ -2858,6 +2962,7 @@ do {
         "2"  { Invoke-MultiList }
         "3"  { Manage-Schedule }
         "4"  { Show-DnsCheck }
+        "5"  { Show-SshCheck }
         "6"  { Check-Single }
         "7"  { Show-Manual }
         # 8 — переключение языка RU⇄EN (без перезапуска, мгновенно)
