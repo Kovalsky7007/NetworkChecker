@@ -92,7 +92,7 @@ param(
 # Используется в меню, шапках отчётов, логах и Руководстве.
 # (В комментариях-истории версии оставлены как есть — это хронология.)
 # ============================================================
-$script:Version    = "1.14.8"
+$script:Version    = "1.14.9"
 $script:VersionTag = "v$script:Version"
 
 # Если передан флаг -DebugMode при запуске — активируем Verbose-вывод сразу.
@@ -1864,24 +1864,45 @@ function Show-DnsCheck {
     $log.Add("Система DNS: $global:CachedDns")
     $log.Add("")
 
-    foreach ($d in @($domains)) {
-        $truth = Resolve-Doh $d                       # эталон (DoH)
+    # ── Проход 1: DoH-эталон + plaintext-результаты с задержкой ──
+    $items = foreach ($d in @($domains)) {
+        $truth = Resolve-Doh $d
         $hasTruth = (@($truth).Count -gt 0)
-
-        # plaintext-резолверы с замером задержки
         $rows = foreach ($rv in $resolvers) {
             $sw  = [System.Diagnostics.Stopwatch]::StartNew()
             $ips = Get-AviaDns $d $rv.Server
             $sw.Stop()
-            $clean = if ($hasTruth -and @($ips).Count -gt 0) { (@($ips) | Where-Object { $truth -contains $_ }).Count -gt 0 } else { $null }
+            $clean = if ($hasTruth -and @($ips).Count -gt 0) { @(@($ips) | Where-Object { $truth -contains $_ }).Count -gt 0 } else { $null }
             [pscustomobject]@{ Name=$rv.Name; Ips=@($ips); Ms=[int]$sw.ElapsedMilliseconds; Clean=$clean }
         }
-        $rows = @($rows)
+        [pscustomobject]@{ Domain=$d; Truth=@($truth); Rows=@($rows) }
+    }
+    $items = @($items)
 
-        # Вердикт по домену
-        $anyIps    = ($rows | Where-Object { $_.Ips.Count -gt 0 }).Count -gt 0
+    # ── Детект заглушки: подозрительный IP (plaintext, которого НЕТ в DoH-эталоне),
+    # встречающийся у >=2 РАЗНЫХ доменов — это стаб-подмена. У легитимной гео-разницы
+    # CDN (google: DoH 64.233.x, локально 216.58.x — оба Google) IP у каждого свой,
+    # поэтому это НЕ помечается перехватом, а лишь «расходится». ──
+    $suspectMap = @{}
+    foreach ($it in $items) {
+        $sus = @($it.Rows | ForEach-Object { $_.Ips } | Select-Object -Unique |
+                 Where-Object { @($it.Truth).Count -gt 0 -and $it.Truth -notcontains $_ })
+        foreach ($ip in $sus) {
+            if (-not $suspectMap.ContainsKey($ip)) { $suspectMap[$ip] = New-Object System.Collections.Generic.HashSet[string] }
+            [void]$suspectMap[$ip].Add($it.Domain)
+        }
+    }
+    $stubIPs = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($kv in $suspectMap.GetEnumerator()) { if ($kv.Value.Count -ge 2) { [void]$stubIPs.Add($kv.Key) } }
+
+    # ── Проход 2: вердикт + вывод ──
+    foreach ($it in $items) {
+        $truth = $it.Truth; $rows = $it.Rows
+        $hasTruth  = (@($truth).Count -gt 0)
+        $anyIps    = @($rows | Where-Object { $_.Ips.Count -gt 0 }).Count -gt 0
         $poisoned  = @($rows | Where-Object { $_.Clean -eq $false })
-        $cleanOnes = @($rows | Where-Object { $_.Clean -eq $true })
+        $suspect   = @($rows | ForEach-Object { $_.Ips } | Select-Object -Unique | Where-Object { $hasTruth -and $truth -notcontains $_ })
+        $stubHit   = @($suspect | Where-Object { $stubIPs.Contains($_) })
 
         if (-not $hasTruth) {
             if (-not $anyIps) { $vt = if($ru){"не резолвится нигде"}else{"no resolution anywhere"}; $vc="DarkGray" }
@@ -1893,21 +1914,21 @@ function Show-DnsCheck {
         elseif ($poisoned.Count -eq 0) {
             $vt = if($ru){"совпадает с DoH (чисто)"}else{"matches DoH (clean)"}; $vc="Green"
         }
-        elseif ($cleanOnes.Count -eq 0) {
-            $vt = if($ru){"ПЕРЕХВАТ DNS :53 (все plaintext ≠ DoH)"}else{"DNS HIJACK :53 (all plaintext != DoH)"}; $vc="Red"
+        elseif ($stubHit.Count -gt 0) {
+            $vt = if($ru){"ПЕРЕХВАТ DNS :53 (заглушка $($stubHit[0]))"}else{"DNS HIJACK :53 (stub $($stubHit[0]))"}; $vc="Red"
         }
         else {
-            $vt = if($ru){"частичная подмена (часть резолверов врёт)"}else{"partial spoof (some resolvers lie)"}; $vc="Red"
+            $vt = if($ru){"расходится с DoH (CDN/гео? не блок — сверь IP)"}else{"differs from DoH (CDN/geo? not a block — compare IPs)"}; $vc="Yellow"
         }
 
         # Вывод
-        Write-Host "  $d" -ForegroundColor Cyan
+        Write-Host "  $($it.Domain)" -ForegroundColor Cyan
         Write-Host ("    {0,-14}: {1}" -f "DoH (эталон)", (& $fmt $truth)) -ForegroundColor White
-        $log.Add($d); $log.Add("  DoH(эталон) : $(& $fmt $truth)")
+        $log.Add($it.Domain); $log.Add("  DoH(эталон) : $(& $fmt $truth)")
         foreach ($row in $rows) {
             $mark = ""; $col = "DarkGray"
             if ($row.Clean -eq $true)  { $col = "Green" }
-            if ($row.Clean -eq $false) { $col = "Red"; $mark = if($ru){"  ≠DoH"}else{"  !=DoH"} }
+            if ($row.Clean -eq $false) { $col = if($stubHit.Count -gt 0){"Red"}else{"Yellow"}; $mark = if($ru){"  ≠DoH"}else{"  !=DoH"} }
             Write-Host ("    {0,-14}: {1}   ({2} ms){3}" -f $row.Name, (& $fmt $row.Ips), $row.Ms, $mark) -ForegroundColor $col
             $log.Add(("  {0,-12}: {1}  ({2} ms){3}" -f $row.Name, (& $fmt $row.Ips), $row.Ms, $mark))
         }
@@ -2463,6 +2484,8 @@ function Show-Manual {
         Write-Host "            фикс вердикта: HTTP:200 побеждает флап TLS-пробы" -ForegroundColor DarkGray
         Write-Host "  v1.14.8   DNS: DoH-эталон (детект перехвата :53), кастомные DNS," -ForegroundColor DarkGray
         Write-Host "            задержка по каждому резолверу" -ForegroundColor DarkGray
+        Write-Host "  v1.14.9   Фикс ложного перехвата: гео-разница CDN (google) теперь" -ForegroundColor DarkGray
+        Write-Host "            «расходится», а не «ПЕРЕХВАТ»; красный — только заглушка" -ForegroundColor DarkGray
         Write-Host ""
 
     } else {
